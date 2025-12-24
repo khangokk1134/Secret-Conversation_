@@ -16,7 +16,7 @@ namespace ChatServer
         private bool _running;
 
         // username -> connection
-        private ConcurrentDictionary<string, ClientConnection> _clients = new();
+        private readonly ConcurrentDictionary<string, ClientConnection> _clients = new();
 
         private readonly string _offlineFolder = "offline";
 
@@ -46,6 +46,7 @@ namespace ChatServer
                 {
                     var tcp = _listener.AcceptTcpClient();
                     var conn = new ClientConnection(tcp, this);
+
                     new Thread(conn.Handle)
                     {
                         IsBackground = true
@@ -76,13 +77,13 @@ namespace ChatServer
         // =========================
         // USER MANAGEMENT
         // =========================
-
         public void Register(string username, ClientConnection connection, string publicKeyXml)
         {
             connection.Username = username;
             connection.PublicKeyXml = publicKeyXml;
 
             _clients[username] = connection;
+
             Console.WriteLine($"User online: {username}");
 
             BroadcastUserList();
@@ -91,15 +92,17 @@ namespace ChatServer
 
         public void Unregister(string username)
         {
-            if (username == null) return;
+            if (string.IsNullOrEmpty(username))
+                return;
 
             _clients.TryRemove(username, out _);
+
             Console.WriteLine($"User offline: {username}");
 
             BroadcastUserList();
         }
 
-        public string GetPublicKey(string username)
+        public string? GetPublicKey(string username)
         {
             return _clients.TryGetValue(username, out var c)
                 ? c.PublicKeyXml
@@ -118,20 +121,26 @@ namespace ChatServer
 
             foreach (var c in _clients.Values)
             {
-                try { c.SendRaw(json); } catch { }
+                try
+                {
+                    c.SendRaw(json);
+                }
+                catch { }
             }
         }
 
         // =========================
         // MESSAGE ROUTING
         // =========================
-
         public void RoutePacket(JsonElement packet)
         {
             string type = packet.GetProperty("type").GetString();
-            string to = packet.TryGetProperty("to", out var t) ? t.GetString() : null;
+            string? to = packet.TryGetProperty("to", out var t) ? t.GetString() : null;
 
-            // Typing indicator: only route, no offline store
+            if (string.IsNullOrEmpty(to))
+                return;
+
+            // typing: chỉ forward, không lưu offline
             if (type == "typing")
             {
                 if (_clients.TryGetValue(to, out var dest))
@@ -139,7 +148,7 @@ namespace ChatServer
                 return;
             }
 
-            // Chat / Recall / Others
+            // chat / recall / ...
             if (_clients.TryGetValue(to, out var target))
             {
                 target.SendRaw(packet.GetRawText());
@@ -155,10 +164,10 @@ namespace ChatServer
         // =========================
         // OFFLINE MESSAGE
         // =========================
-
         private void StoreOffline(string username, string json)
         {
-            if (string.IsNullOrEmpty(username)) return;
+            if (string.IsNullOrEmpty(username))
+                return;
 
             string file = Path.Combine(_offlineFolder, username + ".jsonl");
             File.AppendAllText(file, json + Environment.NewLine);
@@ -167,13 +176,15 @@ namespace ChatServer
         private void DeliverOfflineMessages(string username, ClientConnection connection)
         {
             string file = Path.Combine(_offlineFolder, username + ".jsonl");
-            if (!File.Exists(file)) return;
+            if (!File.Exists(file))
+                return;
 
             var lines = File.ReadAllLines(file);
             foreach (var l in lines)
                 connection.SendRaw(l);
 
             File.Delete(file);
+
             Console.WriteLine($"Delivered {lines.Length} offline messages to {username}");
         }
     }

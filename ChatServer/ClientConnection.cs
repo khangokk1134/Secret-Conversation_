@@ -13,8 +13,8 @@ namespace ChatServer
         private readonly StreamReader _reader;
         private readonly StreamWriter _writer;
 
-        public string Username { get; set; }
-        public string PublicKeyXml { get; set; }
+        public string? Username { get; set; }
+        public string? PublicKeyXml { get; set; }
 
         public ClientConnection(TcpClient tcp, Server server)
         {
@@ -23,7 +23,10 @@ namespace ChatServer
 
             var ns = tcp.GetStream();
             _reader = new StreamReader(ns, Encoding.UTF8);
-            _writer = new StreamWriter(ns, Encoding.UTF8) { AutoFlush = true };
+            _writer = new StreamWriter(ns, Encoding.UTF8)
+            {
+                AutoFlush = true
+            };
         }
 
         public void Handle()
@@ -32,8 +35,9 @@ namespace ChatServer
             {
                 while (true)
                 {
-                    string line = _reader.ReadLine();
-                    if (line == null) break;
+                    string? line = _reader.ReadLine();
+                    if (line == null)
+                        break;
 
                     ProcessPacket(line);
                 }
@@ -57,7 +61,6 @@ namespace ChatServer
         private void ProcessPacket(string json)
         {
             JsonDocument doc;
-
             try
             {
                 doc = JsonDocument.Parse(json);
@@ -91,9 +94,6 @@ namespace ChatServer
                     _server.RoutePacket(root);
                     break;
 
-                // tương lai:
-                // login, logout, group, file, etc.
-
                 default:
                     Console.WriteLine($"Unknown packet type: {type}");
                     break;
@@ -105,8 +105,11 @@ namespace ChatServer
         // =========================
         private void HandleRegister(JsonElement root)
         {
-            string user = root.GetProperty("user").GetString();
-            string pub = root.GetProperty("pubkey").GetString();
+            string? user = root.GetProperty("user").GetString();
+            string? pub = root.GetProperty("pubkey").GetString();
+
+            if (string.IsNullOrEmpty(user) || string.IsNullOrEmpty(pub))
+                return;
 
             Username = user;
             PublicKeyXml = pub;
@@ -116,7 +119,10 @@ namespace ChatServer
 
         private void HandleGetPublicKey(JsonElement root)
         {
-            string user = root.GetProperty("user").GetString();
+            string? user = root.GetProperty("user").GetString();
+            if (string.IsNullOrEmpty(user))
+                return;
+
             var pk = _server.GetPublicKey(user);
 
             var resp = new
@@ -143,7 +149,11 @@ namespace ChatServer
 
         public void Close()
         {
-            try { _tcp.Close(); } catch { }
+            try
+            {
+                _tcp.Close();
+            }
+            catch { }
         }
     }
 }
