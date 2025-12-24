@@ -14,7 +14,27 @@ namespace ChatClient
             pubXml = rsa.ToXmlString(false);
             privXml = rsa.ToXmlString(true);
         }
+        public static string SignData(string data, string privateKeyXml)
+        {
+            using var rsa = RSA.Create();
+            rsa.FromXmlString(privateKeyXml);
 
+            byte[] bytes = Encoding.UTF8.GetBytes(data);
+            byte[] sig = rsa.SignData(bytes, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+
+            return Convert.ToBase64String(sig);
+        }
+
+        public static bool VerifySignature(string data, string signatureB64, string publicKeyXml)
+        {
+            using var rsa = RSA.Create();
+            rsa.FromXmlString(publicKeyXml);
+
+            byte[] bytes = Encoding.UTF8.GetBytes(data);
+            byte[] sig = Convert.FromBase64String(signatureB64);
+
+            return rsa.VerifyData(bytes, sig, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        }
         public static string RsaEncryptBase64(string plain, string publicKeyXml)
         {
             var bytes = Encoding.UTF8.GetBytes(plain);

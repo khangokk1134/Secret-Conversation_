@@ -8,10 +8,11 @@ namespace ChatServer
 {
     public class ClientConnection
     {
-        private TcpClient _tcp;
-        private Server _server;
-        private StreamReader _reader;
-        private StreamWriter _writer;
+        private readonly TcpClient _tcp;
+        private readonly Server _server;
+        private readonly StreamReader _reader;
+        private readonly StreamWriter _writer;
+
         public string Username { get; set; }
         public string PublicKeyXml { get; set; }
 
@@ -19,6 +20,7 @@ namespace ChatServer
         {
             _tcp = tcp;
             _server = server;
+
             var ns = tcp.GetStream();
             _reader = new StreamReader(ns, Encoding.UTF8);
             _writer = new StreamWriter(ns, Encoding.UTF8) { AutoFlush = true };
@@ -33,55 +35,103 @@ namespace ChatServer
                     string line = _reader.ReadLine();
                     if (line == null) break;
 
-                    try
-                    {
-                        var doc = JsonDocument.Parse(line);
-                        var root = doc.RootElement;
-                        var type = root.GetProperty("type").GetString();
-
-                        if (type == "register")
-                        {
-                            string user = root.GetProperty("user").GetString();
-                            string pub = root.GetProperty("pubkey").GetString();
-                            _server.Register(user, this, pub);
-                        }
-                        else if (type == "get_pubkey")
-                        {
-                            string user = root.GetProperty("user").GetString();
-                            var pk = _server.GetPublicKey(user);
-                            var resp = new { type = "pubkey", user = user, pubkey = pk };
-                            SendRaw(JsonSerializer.Serialize(resp));
-                        }
-                        else if (type == "chat")
-                        {
-                            // route to recipient
-                            string to = root.GetProperty("to").GetString();
-                            _server.RouteMessage(to, line);
-                        }
-                        else
-                        {
-                            // unknown -> ignore
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine("Parse error: " + ex.Message);
-                    }
+                    ProcessPacket(line);
                 }
             }
             catch (Exception ex)
             {
-                // connection closed
-                Console.WriteLine("Client disconnected: " + ex.Message);
+                Console.WriteLine("Client error: " + ex.Message);
             }
             finally
             {
                 if (!string.IsNullOrEmpty(Username))
                     _server.Unregister(Username);
+
                 Close();
             }
         }
 
+        // =========================
+        // PACKET HANDLING
+        // =========================
+        private void ProcessPacket(string json)
+        {
+            JsonDocument doc;
+
+            try
+            {
+                doc = JsonDocument.Parse(json);
+            }
+            catch
+            {
+                Console.WriteLine("Invalid JSON received");
+                return;
+            }
+
+            var root = doc.RootElement;
+
+            if (!root.TryGetProperty("type", out var typeProp))
+                return;
+
+            string type = typeProp.GetString();
+
+            switch (type)
+            {
+                case "register":
+                    HandleRegister(root);
+                    break;
+
+                case "get_pubkey":
+                    HandleGetPublicKey(root);
+                    break;
+
+                case "chat":
+                case "typing":
+                case "recall":
+                    _server.RoutePacket(root);
+                    break;
+
+                // tương lai:
+                // login, logout, group, file, etc.
+
+                default:
+                    Console.WriteLine($"Unknown packet type: {type}");
+                    break;
+            }
+        }
+
+        // =========================
+        // HANDLERS
+        // =========================
+        private void HandleRegister(JsonElement root)
+        {
+            string user = root.GetProperty("user").GetString();
+            string pub = root.GetProperty("pubkey").GetString();
+
+            Username = user;
+            PublicKeyXml = pub;
+
+            _server.Register(user, this, pub);
+        }
+
+        private void HandleGetPublicKey(JsonElement root)
+        {
+            string user = root.GetProperty("user").GetString();
+            var pk = _server.GetPublicKey(user);
+
+            var resp = new
+            {
+                type = "pubkey",
+                user = user,
+                pubkey = pk
+            };
+
+            SendRaw(JsonSerializer.Serialize(resp));
+        }
+
+        // =========================
+        // SEND / CLOSE
+        // =========================
         public void SendRaw(string json)
         {
             try
