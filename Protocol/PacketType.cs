@@ -9,6 +9,7 @@
         GetPublicKey,
         PublicKey,
         UserList,
-        Logout
+        Logout,
+        ChatAck
     }
 }

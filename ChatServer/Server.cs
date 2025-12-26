@@ -11,19 +11,25 @@ namespace ChatServer
 {
     public class Server
     {
-        private TcpListener _listener;
-        private Thread _acceptThread;
+        private readonly TcpListener _listener;
+        private readonly Thread _acceptThread;
         private bool _running;
 
-        // username -> connection
+        // ================= CORE STORAGE =================
+        // clientId -> connection (CHỈ ONLINE)
         private readonly ConcurrentDictionary<string, ClientConnection> _clients = new();
+
+        // clientId -> publicKey (CHỈ ONLINE)
+        private readonly ConcurrentDictionary<string, string> _pubKeys = new();
+
+        // clientId -> username (KHÔNG BAO GIỜ XOÁ)
+        private readonly ConcurrentDictionary<string, string> _userNames = new();
 
         private readonly string _offlineFolder = "offline";
 
         public Server(int port)
         {
-            if (!Directory.Exists(_offlineFolder))
-                Directory.CreateDirectory(_offlineFolder);
+            Directory.CreateDirectory(_offlineFolder);
 
             _listener = new TcpListener(IPAddress.Any, port);
             _listener.Start();
@@ -38,6 +44,7 @@ namespace ChatServer
             Console.WriteLine($"Server started on port {port}");
         }
 
+        // ================= ACCEPT =================
         private void AcceptLoop()
         {
             while (_running)
@@ -52,13 +59,9 @@ namespace ChatServer
                         IsBackground = true
                     }.Start();
                 }
-                catch (SocketException)
+                catch
                 {
-                    break;
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine("AcceptLoop error: " + ex.Message);
+                    // ignore
                 }
             }
         }
@@ -67,125 +70,161 @@ namespace ChatServer
         {
             _running = false;
             _listener.Stop();
-
-            foreach (var c in _clients.Values)
-                c.Close();
-
-            Console.WriteLine("Server stopped.");
         }
 
-        // =========================
-        // USER MANAGEMENT
-        // =========================
-        public void Register(string username, ClientConnection connection, string publicKeyXml)
+        // ================= REGISTER =================
+        public void Register(string clientId, string username, string pubKey, ClientConnection conn)
         {
-            connection.Username = username;
-            connection.PublicKeyXml = publicKeyXml;
+            _clients[clientId] = conn;
+            _pubKeys[clientId] = pubKey;
 
-            _clients[username] = connection;
+            // ⚠️ username chỉ set 1 lần
+            _userNames.TryAdd(clientId, username);
 
-            Console.WriteLine($"User online: {username}");
+            Console.WriteLine($"Client online: {username} ({clientId})");
 
             BroadcastUserList();
-            DeliverOfflineMessages(username, connection);
+            DeliverOffline(clientId, conn);
         }
 
-        public void Unregister(string username)
+        // ================= UNREGISTER =================
+        public void Unregister(string clientId)
         {
-            if (string.IsNullOrEmpty(username))
-                return;
+            // ❗ CHỈ XOÁ ONLINE CONNECTION
+            _clients.TryRemove(clientId, out _);
+            _pubKeys.TryRemove(clientId, out _);
 
-            _clients.TryRemove(username, out _);
-
-            Console.WriteLine($"User offline: {username}");
+            // ❌ KHÔNG XOÁ _userNames
+            Console.WriteLine($"Client offline: {clientId}");
 
             BroadcastUserList();
         }
 
-        public string? GetPublicKey(string username)
+        public string? GetPublicKey(string clientId)
         {
-            return _clients.TryGetValue(username, out var c)
-                ? c.PublicKeyXml
-                : null;
+            return _pubKeys.TryGetValue(clientId, out var k) ? k : null;
         }
 
+        // ================= USER LIST =================
         private void BroadcastUserList()
         {
+            var users = _userNames.Select(u => new
+            {
+                clientId = u.Key,
+                user = u.Value,
+                online = _clients.ContainsKey(u.Key)
+            }).ToArray();
+
             var msg = new
             {
                 type = "userlist",
-                users = _clients.Keys.ToArray()
+                users
             };
 
             string json = JsonSerializer.Serialize(msg);
 
             foreach (var c in _clients.Values)
             {
-                try
-                {
-                    c.SendRaw(json);
-                }
-                catch { }
+                c.SendRaw(json);
             }
         }
 
-        // =========================
-        // MESSAGE ROUTING
-        // =========================
-        public void RoutePacket(JsonElement packet)
+        // ================= ROUTING =================
+        public void Route(JsonElement root)
         {
-            string type = packet.GetProperty("type").GetString();
-            string? to = packet.TryGetProperty("to", out var t) ? t.GetString() : null;
-
-            if (string.IsNullOrEmpty(to))
+            if (!root.TryGetProperty("type", out var t))
                 return;
 
-            // typing: chỉ forward, không lưu offline
-            if (type == "typing")
-            {
-                if (_clients.TryGetValue(to, out var dest))
-                    dest.SendRaw(packet.GetRawText());
-                return;
-            }
+            string type = t.GetString() ?? "";
 
-            // chat / recall / ...
-            if (_clients.TryGetValue(to, out var target))
+            switch (type)
             {
-                target.SendRaw(packet.GetRawText());
-                Console.WriteLine($"Routed {type} to {to}");
+                case "chat":
+                    RouteChat(root);
+                    break;
+
+                case "getpublickey":
+                    RouteGetPublicKey(root);
+                    break;
             }
+        }
+
+        // ================= CHAT =================
+        private void RouteChat(JsonElement root)
+        {
+            string fromId = root.GetProperty("fromId").GetString()!;
+            string toId = root.GetProperty("toId").GetString()!;
+
+            // ===== ONLINE =====
+            if (_clients.TryGetValue(toId, out var target))
+            {
+                target.SendRaw(root.GetRawText());
+
+                if (_clients.TryGetValue(fromId, out var sender))
+                {
+                    sender.SendRaw(JsonSerializer.Serialize(new
+                    {
+                        type = "chat_ack",
+                        toId,
+                        status = "delivered"
+                    }));
+                }
+            }
+            // ===== OFFLINE =====
             else
             {
-                StoreOffline(to, packet.GetRawText());
-                Console.WriteLine($"Stored offline {type} for {to}");
+                StoreOffline(toId, root.GetRawText());
+
+                if (_clients.TryGetValue(fromId, out var sender))
+                {
+                    sender.SendRaw(JsonSerializer.Serialize(new
+                    {
+                        type = "chat_ack",
+                        toId,
+                        status = "offline"
+                    }));
+                }
             }
         }
 
-        // =========================
-        // OFFLINE MESSAGE
-        // =========================
-        private void StoreOffline(string username, string json)
+        // ================= PUBLIC KEY =================
+        private void RouteGetPublicKey(JsonElement root)
         {
-            if (string.IsNullOrEmpty(username))
-                return;
+            string clientId = root.GetProperty("clientId").GetString()!;
+            string requester = root.GetProperty("fromId").GetString()!;
 
-            string file = Path.Combine(_offlineFolder, username + ".jsonl");
-            File.AppendAllText(file, json + Environment.NewLine);
+            if (_pubKeys.TryGetValue(clientId, out var key) &&
+                _clients.TryGetValue(requester, out var conn))
+            {
+                conn.SendRaw(JsonSerializer.Serialize(new
+                {
+                    type = "publickey",
+                    clientId,
+                    publicKey = key
+                }));
+            }
         }
 
-        private void DeliverOfflineMessages(string username, ClientConnection connection)
+        // ================= OFFLINE =================
+        private void StoreOffline(string clientId, string json)
         {
-            string file = Path.Combine(_offlineFolder, username + ".jsonl");
-            if (!File.Exists(file))
-                return;
+            File.AppendAllText(
+                Path.Combine(_offlineFolder, clientId + ".jsonl"),
+                json + Environment.NewLine
+            );
+        }
 
-            var lines = File.ReadAllLines(file);
-            foreach (var l in lines)
-                connection.SendRaw(l);
+        private void DeliverOffline(string clientId, ClientConnection conn)
+        {
+            string file = Path.Combine(_offlineFolder, clientId + ".jsonl");
+            if (!File.Exists(file)) return;
+
+            foreach (var line in File.ReadAllLines(file))
+            {
+                conn.SendRaw(line);
+            }
 
             File.Delete(file);
-
-            Console.WriteLine($"Delivered {lines.Length} offline messages to {username}");
         }
     }
 }

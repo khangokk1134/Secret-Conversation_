@@ -13,8 +13,10 @@ namespace ChatServer
         private readonly StreamReader _reader;
         private readonly StreamWriter _writer;
 
-        public string? Username { get; set; }
-        public string? PublicKeyXml { get; set; }
+        // ===== IDENTIFICATION =====
+        public string? ClientId { get; private set; }
+        public string? Username { get; private set; }
+        public string? PublicKey { get; private set; }
 
         public ClientConnection(TcpClient tcp, Server server)
         {
@@ -29,17 +31,18 @@ namespace ChatServer
             };
         }
 
+        // ================= MAIN LOOP =================
         public void Handle()
         {
             try
             {
                 while (true)
                 {
-                    string? line = _reader.ReadLine();
-                    if (line == null)
+                    string? json = _reader.ReadLine();
+                    if (json == null)
                         break;
 
-                    ProcessPacket(line);
+                    ProcessPacket(json);
                 }
             }
             catch (Exception ex)
@@ -48,105 +51,96 @@ namespace ChatServer
             }
             finally
             {
-                if (!string.IsNullOrEmpty(Username))
-                    _server.Unregister(Username);
+                if (ClientId != null)
+                    _server.Unregister(ClientId);
 
                 Close();
             }
         }
 
-        // =========================
-        // PACKET HANDLING
-        // =========================
+        // ================= PACKET PROCESS =================
         private void ProcessPacket(string json)
         {
-            JsonDocument doc;
+            JsonElement root;
+
             try
             {
-                doc = JsonDocument.Parse(json);
+                root = JsonDocument.Parse(json).RootElement;
             }
             catch
             {
-                Console.WriteLine("Invalid JSON received");
+                Console.WriteLine("Invalid JSON from client");
                 return;
             }
 
-            var root = doc.RootElement;
-
-            if (!root.TryGetProperty("type", out var typeProp))
+            if (!root.TryGetProperty("type", out var tProp))
                 return;
 
-            string type = typeProp.GetString();
+            string? type = tProp.GetString();
 
             switch (type)
             {
+                // ===== REGISTER =====
                 case "register":
-                    HandleRegister(root);
-                    break;
+                    {
+                        ClientId = root.GetProperty("clientId").GetString();
+                        Username = root.GetProperty("user").GetString();
+                        PublicKey = root.GetProperty("publicKey").GetString();
 
-                case "get_pubkey":
-                    HandleGetPublicKey(root);
-                    break;
+                        if (ClientId == null || Username == null || PublicKey == null)
+                            return;
 
+                        _server.Register(ClientId, Username, PublicKey, this);
+                        break;
+                    }
+
+                // ===== GET PUBLIC KEY =====
+                case "getpublickey":
+                    {
+                        var reqId = root.GetProperty("clientId").GetString();
+                        if (string.IsNullOrEmpty(reqId))
+                            return;
+
+                        var pk = _server.GetPublicKey(reqId);
+
+                        // ❗ KHÔNG gửi nếu chưa có key
+                        if (pk == null)
+                        {
+                            Console.WriteLine($"Public key not found for {reqId}");
+                            return;
+                        }
+
+                        SendRaw(JsonSerializer.Serialize(new
+                        {
+                            type = "publickey",
+                            clientId = reqId,
+                            publicKey = pk
+                        }));
+                        break;
+                    }
+
+                // ===== CHAT / TYPING =====
                 case "chat":
                 case "typing":
-                case "recall":
-                    _server.RoutePacket(root);
-                    break;
-
-                default:
-                    Console.WriteLine($"Unknown packet type: {type}");
+                    _server.Route(root);
                     break;
             }
         }
 
-        // =========================
-        // HANDLERS
-        // =========================
-        private void HandleRegister(JsonElement root)
-        {
-            string? user = root.GetProperty("user").GetString();
-            string? pub = root.GetProperty("pubkey").GetString();
-
-            if (string.IsNullOrEmpty(user) || string.IsNullOrEmpty(pub))
-                return;
-
-            Username = user;
-            PublicKeyXml = pub;
-
-            _server.Register(user, this, pub);
-        }
-
-        private void HandleGetPublicKey(JsonElement root)
-        {
-            string? user = root.GetProperty("user").GetString();
-            if (string.IsNullOrEmpty(user))
-                return;
-
-            var pk = _server.GetPublicKey(user);
-
-            var resp = new
-            {
-                type = "pubkey",
-                user = user,
-                pubkey = pk
-            };
-
-            SendRaw(JsonSerializer.Serialize(resp));
-        }
-
-        // =========================
-        // SEND / CLOSE
-        // =========================
+        // ================= SEND =================
         public void SendRaw(string json)
         {
             try
             {
                 _writer.WriteLine(json);
             }
-            catch { }
+            catch
+            {
+                // ignore broken connection
+            }
         }
 
+        // ================= CLOSE =================
         public void Close()
         {
             try

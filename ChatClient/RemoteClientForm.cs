@@ -16,11 +16,18 @@ namespace ChatClient
         StreamWriter? _writer;
         Thread? _recvThread;
 
+        // ===== IDENTITY =====
+        readonly string _clientId = Guid.NewGuid().ToString();
         string? _username;
+
         string _pubXml = "", _privXml = "";
 
+        // clientId -> publicKey
         readonly Dictionary<string, string> _pubCache = new();
         readonly Dictionary<string, TaskCompletionSource<string>> _pubWaiters = new();
+
+        // clientId -> username (for display)
+        readonly Dictionary<string, string> _userNames = new();
 
         System.Windows.Forms.Timer _typingTimer;
         string? _typingUser;
@@ -50,20 +57,21 @@ namespace ChatClient
         private void btnConnect_Click(object sender, EventArgs e)
         {
             _username = txtUser.Text.Trim();
-            if (_username.Length == 0) return;
+            if (string.IsNullOrEmpty(_username)) return;
 
             _tcp = new TcpClient();
             _tcp.Connect(txtServerIP.Text.Trim(), int.Parse(txtPort.Text));
-            var ns = _tcp.GetStream();
 
+            var ns = _tcp.GetStream();
             _reader = new StreamReader(ns);
             _writer = new StreamWriter(ns) { AutoFlush = true };
 
             Send(new
             {
                 type = "register",
+                clientId = _clientId,
                 user = _username,
-                pubkey = _pubXml
+                publicKey = _pubXml
             });
 
             _recvThread = new Thread(ReceiveLoop) { IsBackground = true };
@@ -88,19 +96,10 @@ namespace ChatClient
                     switch (type)
                     {
                         case "userlist":
-                            UI(() =>
-                            {
-                                lstUsers.Items.Clear();
-                                foreach (var u in root.GetProperty("users").EnumerateArray())
-                                {
-                                    var name = u.GetString();
-                                    if (!string.IsNullOrEmpty(name) && name != _username)
-                                        lstUsers.Items.Add(name);
-                                }
-                            });
+                            HandleUserList(root);
                             break;
 
-                        case "pubkey":
+                        case "publickey":
                             HandlePubKey(root);
                             break;
 
@@ -111,6 +110,10 @@ namespace ChatClient
                         case "chat":
                             HandleChat(root);
                             break;
+
+                        case "chat_ack":
+                            HandleChatAck(root);
+                            break;
                     }
                 }
             }
@@ -120,54 +123,81 @@ namespace ChatClient
             }
         }
 
-        // ================= PUBKEY =================
-        void HandlePubKey(JsonElement root)
+        // ================= USER LIST =================
+        void HandleUserList(JsonElement root)
         {
-            var user = root.GetProperty("user").GetString();
-            var key = root.GetProperty("pubkey").GetString();
-            if (user == null || key == null) return;
-
-            _pubCache[user] = key;
-
-            if (_pubWaiters.TryGetValue(user, out var tcs))
+            UI(() =>
             {
-                tcs.TrySetResult(key);
-                _pubWaiters.Remove(user);
-            }
+                lstUsers.Items.Clear();
+                _userNames.Clear();
 
-            UI(() => rtbChat.AppendText($"[Got pubkey of {user}]\n"));
+                foreach (var u in root.GetProperty("users").EnumerateArray())
+                {
+                    var id = u.GetProperty("clientId").GetString();
+                    var name = u.GetProperty("user").GetString();
+
+                    if (id == null || name == null || id == _clientId)
+                        continue;
+
+                    _userNames[id] = name;
+                    lstUsers.Items.Add(name);
+                }
+            });
         }
 
-        async Task<string?> EnsurePubKeyAsync(string user)
+        // ================= PUBLIC KEY =================
+        void HandlePubKey(JsonElement root)
         {
-            if (_pubCache.TryGetValue(user, out var key))
+            var id = root.GetProperty("clientId").GetString();
+            var key = root.GetProperty("publicKey").GetString();
+
+            if (string.IsNullOrEmpty(id) || string.IsNullOrEmpty(key))
+                return; // ❗ BỎ QUA nếu key null
+
+            _pubCache[id] = key;
+
+            if (_pubWaiters.TryGetValue(id, out var tcs))
+            {
+                tcs.TrySetResult(key);
+                _pubWaiters.Remove(id);
+            }
+        }
+
+        async Task<string?> EnsurePubKeyAsync(string clientId)
+        {
+            if (_pubCache.TryGetValue(clientId, out var key))
                 return key;
 
-            if (!_pubWaiters.ContainsKey(user))
+            if (!_pubWaiters.ContainsKey(clientId))
             {
-                _pubWaiters[user] = new TaskCompletionSource<string>();
-                Send(new { type = "get_pubkey", user });
+                _pubWaiters[clientId] = new TaskCompletionSource<string>();
+                Send(new
+                {
+                    type = "getpublickey",
+                    clientId
+                });
             }
 
-            var task = _pubWaiters[user].Task;
-            var done = await Task.WhenAny(task, Task.Delay(2000));
+            var task = _pubWaiters[clientId].Task;
+            var done = await Task.WhenAny(task, Task.Delay(3000));
             return done == task ? task.Result : null;
         }
 
         // ================= CHAT =================
         async void HandleChat(JsonElement root)
         {
-            var from = root.GetProperty("from").GetString()!;
-            var encKey = root.GetProperty("encKey").GetString()!;
-            var encMsg = root.GetProperty("encMsg").GetString()!;
-            var sig = root.GetProperty("sig").GetString()!;
+            var fromId = root.GetProperty("fromId").GetString();
+            var fromUser = root.GetProperty("fromUser").GetString();
+            var encKey = root.GetProperty("encKey").GetString();
+            var encMsg = root.GetProperty("encMsg").GetString();
+            var sig = root.GetProperty("sig").GetString();
 
-            var pub = await EnsurePubKeyAsync(from);
-            if (pub == null)
-            {
-                UI(() => rtbChat.AppendText($"[Missing pubkey of {from}]\n"));
+            if (fromId == null || fromUser == null ||
+                encKey == null || encMsg == null || sig == null)
                 return;
-            }
+
+            var pub = await EnsurePubKeyAsync(fromId);
+            if (pub == null) return;
 
             var aesB64 = CryptoHelper.RsaDecryptBase64(encKey, _privXml);
             var aes = Convert.FromBase64String(aesB64);
@@ -178,55 +208,77 @@ namespace ChatClient
             UI(() =>
             {
                 rtbChat.AppendText(ok
-                    ? $"{from}: {plain}\n"
-                    : $"[INVALID SIGNATURE from {from}]\n");
+                    ? $"{fromUser}: {plain}\n"
+                    : $"[INVALID SIGNATURE]\n");
             });
         }
 
         // ================= SEND =================
         private async void btnSend_Click(object sender, EventArgs e)
         {
-            if (_writer == null || lstUsers.SelectedItem == null) return;
+            if (lstUsers.SelectedItem == null)
+                return;
 
-            var to = lstUsers.SelectedItem.ToString()!;
+            var toUser = lstUsers.SelectedItem.ToString()!;
+            var toId = GetClientIdByName(toUser);
+            if (toId == null)
+                return;
+
             var plain = txtMessage.Text.Trim();
-            if (plain.Length == 0) return;
+            if (plain.Length == 0)
+                return;
 
-            var pub = await EnsurePubKeyAsync(to);
+            var pub = await EnsurePubKeyAsync(toId);
             if (pub == null)
             {
-                MessageBox.Show($"Cannot get public key of {to}");
+                MessageBox.Show("Cannot get public key");
                 return;
             }
 
             var aes = CryptoHelper.GenerateAesKey();
             var encMsg = CryptoHelper.AesEncryptToBase64(plain, aes);
-            var encKey = CryptoHelper.RsaEncryptBase64(Convert.ToBase64String(aes), pub);
+            var encKey = CryptoHelper.RsaEncryptBase64(
+                Convert.ToBase64String(aes), pub);
             var sig = CryptoHelper.SignData(plain, _privXml);
 
             Send(new
             {
                 type = "chat",
-                from = _username,
-                to,
+                fromId = _clientId,
+                fromUser = _username,
+                toId,
+                toUser,
                 encKey,
                 encMsg,
                 sig
             });
 
-            UI(() => rtbChat.AppendText($"Me → {to}: {plain}\n"));
+            UI(() => rtbChat.AppendText($"Me → {toUser}: {plain}\n"));
             txtMessage.Clear();
-            ClearTyping();
+        }
+
+        string? GetClientIdByName(string name)
+        {
+            foreach (var kv in _userNames)
+                if (kv.Value == name)
+                    return kv.Key;
+            return null;
         }
 
         // ================= TYPING =================
         void TxtMessage_TextChanged(object? sender, EventArgs e)
         {
+            if (lstUsers.SelectedItem == null) return;
+
+            var toId = GetClientIdByName(lstUsers.SelectedItem.ToString()!);
+            if (toId == null) return;
+
             Send(new
             {
                 type = "typing",
-                from = _username,
-                to = lstUsers.SelectedItem?.ToString(),
+                fromId = _clientId,
+                fromUser = _username,
+                toId,
                 isTyping = true
             });
 
@@ -236,17 +288,18 @@ namespace ChatClient
 
         void HandleTyping(JsonElement root)
         {
-            var from = root.GetProperty("from").GetString();
+            var fromUser = root.GetProperty("fromUser").GetString();
             var isTyping = root.GetProperty("isTyping").GetBoolean();
-            if (from == null) return;
+
+            if (fromUser == null) return;
 
             UI(() =>
             {
                 ClearTyping();
                 if (isTyping)
                 {
-                    _typingUser = from;
-                    rtbChat.AppendText($"[{from} is typing...]\n");
+                    _typingUser = fromUser;
+                    rtbChat.AppendText($"[{fromUser} is typing...]\n");
                 }
             });
         }
@@ -254,9 +307,8 @@ namespace ChatClient
         void ClearTyping()
         {
             if (_typingUser == null) return;
-            var text = rtbChat.Text.Replace($"[{_typingUser} is typing...]\n", "");
-            rtbChat.Text = text;
-            rtbChat.SelectionStart = rtbChat.TextLength;
+            rtbChat.Text = rtbChat.Text.Replace(
+                $"[{_typingUser} is typing...]\n", "");
             _typingUser = null;
         }
 
@@ -272,8 +324,24 @@ namespace ChatClient
             else a();
         }
 
-        // ===== DESIGNER SAFE =====
         private void btnGetPubKey_Click(object sender, EventArgs e) { }
         private void rtbChat_TextChanged(object sender, EventArgs e) { }
+
+        //HandlechatACK
+        void HandleChatAck(JsonElement root)
+        {
+            var status = root.GetProperty("status").GetString();
+
+            UI(() =>
+            {
+                if (status == "delivered")
+                    rtbChat.AppendText("[✓ Delivered]\n");
+                else if (status == "offline")
+                    rtbChat.AppendText("[⚠ User offline – saved]\n");
+                else
+                    rtbChat.AppendText("[✗ Send failed]\n");
+            });
+        }
+
     }
 }
