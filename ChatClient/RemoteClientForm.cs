@@ -28,6 +28,7 @@ namespace ChatClient
 
         // clientId -> username
         readonly Dictionary<string, string> _userNames = new();
+        string? _activePeerId = null; // đang mở chat với ai
 
         // ===== message tracking (PRO) =====
         readonly Dictionary<string, string> _sentMessagePreview = new(); // messageId -> preview
@@ -66,6 +67,17 @@ namespace ChatClient
             };
 
             txtMessage.TextChanged += TxtMessage_TextChanged;
+            lstUsers.SelectedIndexChanged += (s, e) =>
+            {
+                if (lstUsers.SelectedItem == null) return;
+
+                var display = lstUsers.SelectedItem.ToString()!;
+                var peerId = GetClientIdByName(display);
+                if (peerId == null) return;
+
+                var peerUser = display.Replace(" (offline)", "").Trim();
+                SwitchConversation(peerId, peerUser);
+            };
 
             this.FormClosing += RemoteClientForm_FormClosing;
         }
@@ -237,12 +249,28 @@ namespace ChatClient
 
             bool ok = CryptoHelper.VerifySignature(plain, pkt.Sig, pub);
 
-            UI(() =>
+            if (!ok)
             {
-                rtbChat.AppendText(ok
-                    ? $"{pkt.FromUser}: {plain}\n"
-                    : "[INVALID SIGNATURE]\n");
+                UI(() => rtbChat.AppendText("[INVALID SIGNATURE]\n"));
+                return;
+            }
+
+            // lưu history (in)
+            SaveHistory(new ChatLogEntry
+            {
+                Ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                Dir = "in",
+                PeerId = pkt.FromId,
+                PeerUser = pkt.FromUser,
+                Text = plain,
+                MessageId = pkt.MessageId ?? ""
             });
+
+            // chỉ show lên màn hình nếu đang mở đúng cuộc chat đó
+            if (_activePeerId == pkt.FromId)
+            {
+                UI(() => rtbChat.AppendText($"{pkt.FromUser}: {plain}\n"));
+            }
         }
 
         // ================= SEND CHAT (PRO) =================
@@ -282,6 +310,18 @@ namespace ChatClient
                 EncMsg = encMsg,
                 Sig = sig
             });
+
+            // lưu history (out)
+            SaveHistory(new ChatLogEntry
+            {
+                Ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                Dir = "out",
+                PeerId = toId,
+                PeerUser = display.Replace(" (offline)", "").Trim(),
+                Text = plain,
+                MessageId = msgId
+            });
+
 
             _sentMessagePreview[msgId] = $"Me → {display}: {plain}";
             UI(() => rtbChat.AppendText($"Me → {display}: {plain}\n"));
@@ -397,6 +437,79 @@ namespace ChatClient
             try { _tcp?.Close(); } catch { }
         }
 
+        // ================= HISTORY (STEP 2) =================
+        class ChatLogEntry
+        {
+            public long Ts { get; set; }
+            public string Dir { get; set; } = "";      // "in" | "out" | "status"
+            public string PeerId { get; set; } = "";
+            public string PeerUser { get; set; } = "";
+            public string Text { get; set; } = "";
+            public string MessageId { get; set; } = "";
+            public string Status { get; set; } = "";   // delivered/offline/...
+        }
+
+        string GetHistoryFile(string peerId)
+        {
+            var root = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "history", _clientId);
+            Directory.CreateDirectory(root);
+            return Path.Combine(root, $"{peerId}.jsonl");
+        }
+
+        void SaveHistory(ChatLogEntry e)
+        {
+            try
+            {
+                var file = GetHistoryFile(e.PeerId);
+                File.AppendAllText(file, JsonSerializer.Serialize(e) + Environment.NewLine);
+            }
+            catch
+            {
+                // ignore history errors
+            }
+        }
+
+        void LoadHistoryToChatBox(string peerId)
+        {
+            try
+            {
+                var file = GetHistoryFile(peerId);
+
+                UI(() => rtbChat.Clear());
+
+                if (!File.Exists(file)) return;
+
+                foreach (var line in File.ReadLines(file))
+                {
+                    if (string.IsNullOrWhiteSpace(line)) continue;
+
+                    ChatLogEntry? e = null;
+                    try { e = JsonSerializer.Deserialize<ChatLogEntry>(line); }
+                    catch { continue; }
+
+                    if (e == null) continue;
+
+                    if (e.Dir == "out")
+                        UI(() => rtbChat.AppendText($"Me → {e.PeerUser}: {e.Text}\n"));
+                    else if (e.Dir == "in")
+                        UI(() => rtbChat.AppendText($"{e.PeerUser}: {e.Text}\n"));
+                    else if (e.Dir == "status")
+                        UI(() => rtbChat.AppendText($"[{e.Status}] {e.Text}\n"));
+                }
+            }
+            catch
+            {
+                // ignore
+            }
+        }
+
+        void SwitchConversation(string peerId, string peerUser)
+        {
+            _activePeerId = peerId;
+            LoadHistoryToChatBox(peerId);
+            UI(() => rtbChat.AppendText($"--- Chat with {peerUser} ---\n"));
+        }
+
         // ===== Designer stubs =====
         private void btnGetPubKey_Click(object sender, EventArgs e) { }
         private void rtbChat_TextChanged(object sender, EventArgs e) { }
@@ -410,5 +523,6 @@ namespace ChatClient
             if (InvokeRequired) BeginInvoke(a);
             else a();
         }
+
     }
 }
