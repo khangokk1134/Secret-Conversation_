@@ -2,27 +2,22 @@
 using System.Collections.Concurrent;
 using System.IO;
 using System.Linq;
-using System.Net;
-using System.Net.Sockets;
 using System.Text.Json;
-using System.Threading;
+using Protocol;
 
 namespace ChatServer
 {
     public class Server
     {
-        private readonly TcpListener _listener;
-        private readonly Thread _acceptThread;
+        private readonly System.Net.Sockets.TcpListener _listener;
+        private readonly System.Threading.Thread _acceptThread;
         private bool _running;
 
-        // ================= CORE STORAGE =================
-        // clientId -> connection (CHỈ ONLINE)
+        // ONLINE
         private readonly ConcurrentDictionary<string, ClientConnection> _clients = new();
-
-        // clientId -> publicKey (CHỈ ONLINE)
         private readonly ConcurrentDictionary<string, string> _pubKeys = new();
 
-        // clientId -> username (KHÔNG BAO GIỜ XOÁ)
+        // NEVER delete
         private readonly ConcurrentDictionary<string, string> _userNames = new();
 
         private readonly string _offlineFolder = "offline";
@@ -31,20 +26,16 @@ namespace ChatServer
         {
             Directory.CreateDirectory(_offlineFolder);
 
-            _listener = new TcpListener(IPAddress.Any, port);
+            _listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Any, port);
             _listener.Start();
 
             _running = true;
-            _acceptThread = new Thread(AcceptLoop)
-            {
-                IsBackground = true
-            };
+            _acceptThread = new System.Threading.Thread(AcceptLoop) { IsBackground = true };
             _acceptThread.Start();
 
             Console.WriteLine($"Server started on port {port}");
         }
 
-        // ================= ACCEPT =================
         private void AcceptLoop()
         {
             while (_running)
@@ -53,32 +44,27 @@ namespace ChatServer
                 {
                     var tcp = _listener.AcceptTcpClient();
                     var conn = new ClientConnection(tcp, this);
-
-                    new Thread(conn.Handle)
-                    {
-                        IsBackground = true
-                    }.Start();
+                    new System.Threading.Thread(conn.Handle) { IsBackground = true }.Start();
                 }
-                catch
-                {
-                    // ignore
-                }
+                catch { }
             }
         }
 
         public void Stop()
         {
             _running = false;
-            _listener.Stop();
+            try { _listener.Stop(); } catch { }
         }
 
-        // ================= REGISTER =================
         public void Register(string clientId, string username, string pubKey, ClientConnection conn)
         {
+            if (_clients.TryGetValue(clientId, out var oldConn))
+            {
+                try { oldConn.Close(); } catch { }
+            }
+
             _clients[clientId] = conn;
             _pubKeys[clientId] = pubKey;
-
-            // ⚠️ username chỉ set 1 lần
             _userNames.TryAdd(clientId, username);
 
             Console.WriteLine($"Client online: {username} ({clientId})");
@@ -87,125 +73,156 @@ namespace ChatServer
             DeliverOffline(clientId, conn);
         }
 
-        // ================= UNREGISTER =================
         public void Unregister(string clientId)
         {
-            // ❗ CHỈ XOÁ ONLINE CONNECTION
             _clients.TryRemove(clientId, out _);
             _pubKeys.TryRemove(clientId, out _);
 
-            // ❌ KHÔNG XOÁ _userNames
             Console.WriteLine($"Client offline: {clientId}");
-
             BroadcastUserList();
         }
 
-        public string? GetPublicKey(string clientId)
-        {
-            return _pubKeys.TryGetValue(clientId, out var k) ? k : null;
-        }
-
-        // ================= USER LIST =================
         private void BroadcastUserList()
         {
-            var users = _userNames.Select(u => new
+            var users = _userNames.Select(u => new UserInfo
             {
-                clientId = u.Key,
-                user = u.Value,
-                online = _clients.ContainsKey(u.Key)
+                ClientId = u.Key,
+                User = u.Value,
+                Online = _clients.ContainsKey(u.Key)
             }).ToArray();
 
-            var msg = new
-            {
-                type = "userlist",
-                users
-            };
-
-            string json = JsonSerializer.Serialize(msg);
+            var pkt = new UserListPacket { Users = users };
 
             foreach (var c in _clients.Values)
+                c.SendPacket(pkt);
+        }
+
+        public void Route(string json, ClientConnection senderConn)
+        {
+            PacketBase? basePkt;
+            try { basePkt = JsonSerializer.Deserialize<PacketBase>(json); }
+            catch { return; }
+            if (basePkt == null) return;
+
+            switch (basePkt.Type)
             {
-                c.SendRaw(json);
+                case PacketType.Chat:
+                    RouteChat(json);
+                    break;
+
+                case PacketType.Typing:
+                    RouteTyping(json);
+                    break;
+
+                case PacketType.GetPublicKey:
+                    RouteGetPublicKey(json, senderConn);
+                    break;
+
+                case PacketType.Logout:
+                    RouteLogout(senderConn);
+                    break;
+
+                case PacketType.Recall:
+                    RouteRecall(json);
+                    break;
             }
         }
 
-        // ================= ROUTING =================
-        public void Route(JsonElement root)
+        private void RouteChat(string json)
         {
-            if (!root.TryGetProperty("type", out var t))
+            ChatPacket? pkt;
+            try { pkt = JsonSerializer.Deserialize<ChatPacket>(json); }
+            catch { return; }
+            if (pkt == null) return;
+
+            if (string.IsNullOrEmpty(pkt.FromId) || string.IsNullOrEmpty(pkt.ToId))
                 return;
 
-            string type = t.GetString() ?? "";
-
-            switch (type)
+            if (_clients.TryGetValue(pkt.ToId, out var target))
             {
-                case "chat":
-                    RouteChat(root);
-                    break;
+                target.SendRaw(json);
 
-                case "getpublickey":
-                    RouteGetPublicKey(root);
-                    break;
-            }
-        }
-
-        // ================= CHAT =================
-        private void RouteChat(JsonElement root)
-        {
-            string fromId = root.GetProperty("fromId").GetString()!;
-            string toId = root.GetProperty("toId").GetString()!;
-
-            // ===== ONLINE =====
-            if (_clients.TryGetValue(toId, out var target))
-            {
-                target.SendRaw(root.GetRawText());
-
-                if (_clients.TryGetValue(fromId, out var sender))
+                if (_clients.TryGetValue(pkt.FromId, out var sender))
                 {
-                    sender.SendRaw(JsonSerializer.Serialize(new
+                    sender.SendPacket(new ChatAckPacket
                     {
-                        type = "chat_ack",
-                        toId,
-                        status = "delivered"
-                    }));
+                        MessageId = pkt.MessageId,
+                        FromId = pkt.FromId,
+                        ToId = pkt.ToId,
+                        Status = "delivered"
+                    });
                 }
             }
-            // ===== OFFLINE =====
             else
             {
-                StoreOffline(toId, root.GetRawText());
+                StoreOffline(pkt.ToId, json);
 
-                if (_clients.TryGetValue(fromId, out var sender))
+                if (_clients.TryGetValue(pkt.FromId, out var sender))
                 {
-                    sender.SendRaw(JsonSerializer.Serialize(new
+                    sender.SendPacket(new ChatAckPacket
                     {
-                        type = "chat_ack",
-                        toId,
-                        status = "offline"
-                    }));
+                        MessageId = pkt.MessageId,
+                        FromId = pkt.FromId,
+                        ToId = pkt.ToId,
+                        Status = "offline"
+                    });
                 }
             }
         }
 
-        // ================= PUBLIC KEY =================
-        private void RouteGetPublicKey(JsonElement root)
+        private void RouteTyping(string json)
         {
-            string clientId = root.GetProperty("clientId").GetString()!;
-            string requester = root.GetProperty("fromId").GetString()!;
+            TypingPacket? pkt;
+            try { pkt = JsonSerializer.Deserialize<TypingPacket>(json); }
+            catch { return; }
+            if (pkt == null) return;
 
-            if (_pubKeys.TryGetValue(clientId, out var key) &&
-                _clients.TryGetValue(requester, out var conn))
+            if (string.IsNullOrEmpty(pkt.ToId))
+                return;
+
+            if (_clients.TryGetValue(pkt.ToId, out var target))
+                target.SendRaw(json);
+        }
+
+        private void RouteGetPublicKey(string json, ClientConnection requesterConn)
+        {
+            GetPublicKeyPacket? pkt;
+            try { pkt = JsonSerializer.Deserialize<GetPublicKeyPacket>(json); }
+            catch { return; }
+            if (pkt == null) return;
+
+            if (string.IsNullOrEmpty(pkt.ClientId))
+                return;
+
+            if (_pubKeys.TryGetValue(pkt.ClientId, out var key))
             {
-                conn.SendRaw(JsonSerializer.Serialize(new
+                requesterConn.SendPacket(new PublicKeyPacket
                 {
-                    type = "publickey",
-                    clientId,
-                    publicKey = key
-                }));
+                    ClientId = pkt.ClientId,
+                    PublicKey = key
+                });
             }
         }
 
-        // ================= OFFLINE =================
+        private void RouteLogout(ClientConnection senderConn)
+        {
+            if (!string.IsNullOrEmpty(senderConn.ClientId))
+                Unregister(senderConn.ClientId!);
+
+            try { senderConn.Close(); } catch { }
+        }
+
+        private void RouteRecall(string json)
+        {
+            RecallPacket? pkt;
+            try { pkt = JsonSerializer.Deserialize<RecallPacket>(json); }
+            catch { return; }
+            if (pkt == null) return;
+
+            if (!string.IsNullOrEmpty(pkt.ToId) && _clients.TryGetValue(pkt.ToId, out var target))
+                target.SendRaw(json);
+        }
+
         private void StoreOffline(string clientId, string json)
         {
             File.AppendAllText(
@@ -221,10 +238,14 @@ namespace ChatServer
 
             foreach (var line in File.ReadAllLines(file))
             {
-                conn.SendRaw(line);
+                if (string.IsNullOrWhiteSpace(line)) continue;
+
+                // đảm bảo gửi JSON sạch, không \n dư
+                var json = line.Trim();
+                conn.SendRaw(json);
             }
 
-            File.Delete(file);
+            try { File.Delete(file); } catch { }
         }
     }
 }

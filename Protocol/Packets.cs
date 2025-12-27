@@ -24,6 +24,8 @@
         public string EncKey { get; set; } = string.Empty;
         public string EncMsg { get; set; } = string.Empty;
         public string Sig { get; set; } = string.Empty;
+        public string MessageId { get; set; } = Guid.NewGuid().ToString();
+        public long Timestamp { get; set; } = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
         public ChatPacket()
         {
@@ -70,6 +72,7 @@
 
     public class ChatAckPacket : PacketBase
     {
+        public string MessageId { get; set; } = "";
         public string FromId { get; set; } = "";
         public string ToId { get; set; } = "";
         public string Status { get; set; } = ""; // delivered | offline | error
@@ -95,5 +98,26 @@
     {
         public string ClientId { get; set; } = string.Empty;
         public string User { get; set; } = string.Empty;
+        public bool Online { get; set; }
+    }
+    // ================= LOGOUT =================
+    public class LogoutPacket : PacketBase
+    {
+        public string ClientId { get; set; } = string.Empty;
+
+        public LogoutPacket()
+        {
+            Type = PacketType.Logout;
+        }
+    }
+
+    // ================= RECALL =================
+    public class RecallPacket : PacketBase
+    {
+        public string FromId { get; set; } = string.Empty;
+        public string ToId { get; set; } = string.Empty;
+        public string MessageId { get; set; } = string.Empty;
+
+        public RecallPacket() { Type = PacketType.Recall; }
     }
 }

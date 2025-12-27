@@ -1,8 +1,8 @@
 ﻿using System;
-using System.IO;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
+using Protocol;
 
 namespace ChatServer
 {
@@ -10,10 +10,8 @@ namespace ChatServer
     {
         private readonly TcpClient _tcp;
         private readonly Server _server;
-        private readonly StreamReader _reader;
-        private readonly StreamWriter _writer;
+        private readonly NetworkStream _ns;
 
-        // ===== IDENTIFICATION =====
         public string? ClientId { get; private set; }
         public string? Username { get; private set; }
         public string? PublicKey { get; private set; }
@@ -22,132 +20,105 @@ namespace ChatServer
         {
             _tcp = tcp;
             _server = server;
-
-            var ns = tcp.GetStream();
-            _reader = new StreamReader(ns, Encoding.UTF8);
-            _writer = new StreamWriter(ns, Encoding.UTF8)
-            {
-                AutoFlush = true
-            };
+            _ns = tcp.GetStream();
         }
 
-        // ================= MAIN LOOP =================
         public void Handle()
         {
             try
             {
                 while (true)
                 {
-                    string? json = _reader.ReadLine();
-                    if (json == null)
-                        break;
+                    string? json = PacketIO.ReadJson(_ns);
+                    if (json == null) break;
 
                     ProcessPacket(json);
                 }
+            }
+            catch (IOException)
+            {
+                // Client closed connection normally → ignore
+            }
+            catch (ObjectDisposedException)
+            {
+                // Stream already disposed → ignore
             }
             catch (Exception ex)
             {
                 Console.WriteLine("Client error: " + ex.Message);
             }
+
             finally
             {
-                if (ClientId != null)
-                    _server.Unregister(ClientId);
+                if (!string.IsNullOrEmpty(ClientId))
+                    _server.Unregister(ClientId!);
 
                 Close();
             }
         }
 
-        // ================= PACKET PROCESS =================
         private void ProcessPacket(string json)
         {
-            JsonElement root;
+            PacketBase? basePkt;
+            try { basePkt = JsonSerializer.Deserialize<PacketBase>(json); }
+            catch { return; }
 
-            try
+            if (basePkt == null) return;
+
+            switch (basePkt.Type)
             {
-                root = JsonDocument.Parse(json).RootElement;
-            }
-            catch
-            {
-                Console.WriteLine("Invalid JSON from client");
-                return;
-            }
-
-            if (!root.TryGetProperty("type", out var tProp))
-                return;
-
-            string? type = tProp.GetString();
-
-            switch (type)
-            {
-                // ===== REGISTER =====
-                case "register":
+                case PacketType.Register:
                     {
-                        ClientId = root.GetProperty("clientId").GetString();
-                        Username = root.GetProperty("user").GetString();
-                        PublicKey = root.GetProperty("publicKey").GetString();
+                        var pkt = JsonSerializer.Deserialize<RegisterPacket>(json);
+                        if (pkt == null) return;
 
-                        if (ClientId == null || Username == null || PublicKey == null)
+                        ClientId = pkt.ClientId;
+                        Username = pkt.User;
+                        PublicKey = pkt.PublicKey;
+
+                        if (string.IsNullOrWhiteSpace(ClientId) ||
+                            string.IsNullOrWhiteSpace(Username) ||
+                            string.IsNullOrWhiteSpace(PublicKey))
                             return;
 
-                        _server.Register(ClientId, Username, PublicKey, this);
+                        _server.Register(pkt.ClientId, pkt.User, pkt.PublicKey, this);
                         break;
                     }
 
-                // ===== GET PUBLIC KEY =====
-                case "getpublickey":
-                    {
-                        var reqId = root.GetProperty("clientId").GetString();
-                        if (string.IsNullOrEmpty(reqId))
-                            return;
+                case PacketType.GetPublicKey:
+                case PacketType.Chat:
+                case PacketType.Typing:
+                case PacketType.Logout:
+                case PacketType.Recall:
+                    _server.Route(json, this);
+                    break;
 
-                        var pk = _server.GetPublicKey(reqId);
-
-                        // ❗ KHÔNG gửi nếu chưa có key
-                        if (pk == null)
-                        {
-                            Console.WriteLine($"Public key not found for {reqId}");
-                            return;
-                        }
-
-                        SendRaw(JsonSerializer.Serialize(new
-                        {
-                            type = "publickey",
-                            clientId = reqId,
-                            publicKey = pk
-                        }));
-                        break;
-                    }
-
-                // ===== CHAT / TYPING =====
-                case "chat":
-                case "typing":
-                    _server.Route(root);
+                default:
                     break;
             }
         }
 
-        // ================= SEND =================
+        public void SendPacket<T>(T packet)
+        {
+            try
+            {
+                PacketIO.SendPacket(_ns, packet);
+            }
+            catch { }
+        }
+
         public void SendRaw(string json)
         {
             try
             {
-                _writer.WriteLine(json);
-            }
-            catch
-            {
-                // ignore broken connection
-            }
-        }
-
-        // ================= CLOSE =================
-        public void Close()
-        {
-            try
-            {
-                _tcp.Close();
+                PacketIO.SendJson(_ns, json);
             }
             catch { }
+        }
+
+        public void Close()
+        {
+            try { _tcp.Close(); } catch { }
         }
     }
 }
