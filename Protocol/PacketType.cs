@@ -10,6 +10,7 @@
         PublicKey,
         UserList,
         Logout,
-        ChatAck
+        ChatAck,
+        DeliveryReceipt
     }
 }

@@ -67,7 +67,7 @@
             // 
             btnConnect.Location = new Point(477, 10);
             btnConnect.Name = "btnConnect";
-            btnConnect.Size = new Size(122, 37);
+            btnConnect.Size = new Size(142, 37);
             btnConnect.TabIndex = 3;
             btnConnect.Text = "Connect";
             btnConnect.UseVisualStyleBackColor = true;
@@ -138,7 +138,7 @@
             // 
             // RemoteClientForm
             // 
-            ClientSize = new Size(644, 370);
+            ClientSize = new Size(631, 380);
             Controls.Add(label2);
             Controls.Add(label1);
             Controls.Add(btnGetPubKey);

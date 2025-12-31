@@ -1,4 +1,6 @@
-﻿namespace Protocol
+﻿using System;
+
+namespace Protocol
 {
     // ================= REGISTER =================
     public class RegisterPacket : PacketBase
@@ -24,6 +26,8 @@
         public string EncKey { get; set; } = string.Empty;
         public string EncMsg { get; set; } = string.Empty;
         public string Sig { get; set; } = string.Empty;
+
+        // Sender nên set MessageId khi gửi; JSON deserialize sẽ overwrite giá trị này
         public string MessageId { get; set; } = Guid.NewGuid().ToString();
         public long Timestamp { get; set; } = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
@@ -52,6 +56,9 @@
     {
         public string ClientId { get; set; } = string.Empty;
 
+        // optional: người đang yêu cầu key (server có thể không dùng)
+        public string FromId { get; set; } = string.Empty;
+
         public GetPublicKeyPacket()
         {
             Type = PacketType.GetPublicKey;
@@ -70,12 +77,17 @@
         }
     }
 
+    // ================= ACK (SERVER -> SENDER) =================
     public class ChatAckPacket : PacketBase
     {
         public string MessageId { get; set; } = "";
-        public string FromId { get; set; } = "";
-        public string ToId { get; set; } = "";
-        public string Status { get; set; } = ""; // delivered | offline | error
+        public string FromId { get; set; } = ""; // sender
+        public string ToId { get; set; } = "";   // receiver
+
+        // recommended statuses:
+        // accepted | delivered | offline_saved | delivered_to_client
+        // (timeout is client-side only)
+        public string Status { get; set; } = "";
 
         public ChatAckPacket()
         {
@@ -83,10 +95,29 @@
         }
     }
 
+    // ================= DELIVERY RECEIPT (RECEIVER -> SERVER) =================
+    public class DeliveryReceiptPacket : PacketBase
+    {
+        public string MessageId { get; set; } = "";
+        public string FromId { get; set; } = "";   // receiver
+        public string ToId { get; set; } = "";     // original sender
+
+        // for now we use: received
+        // (later can extend: delivered/read, but server currently only handles "received")
+        public string Status { get; set; } = "";
+
+        public long Timestamp { get; set; }
+
+        public DeliveryReceiptPacket()
+        {
+            Type = PacketType.DeliveryReceipt;
+        }
+    }
+
     // ================= USER LIST =================
     public class UserListPacket : PacketBase
     {
-        public UserInfo[] Users { get; set; } = new UserInfo[0];
+        public UserInfo[] Users { get; set; } = Array.Empty<UserInfo>();
 
         public UserListPacket()
         {
@@ -100,6 +131,7 @@
         public string User { get; set; } = string.Empty;
         public bool Online { get; set; }
     }
+
     // ================= LOGOUT =================
     public class LogoutPacket : PacketBase
     {
@@ -118,6 +150,9 @@
         public string ToId { get; set; } = string.Empty;
         public string MessageId { get; set; } = string.Empty;
 
-        public RecallPacket() { Type = PacketType.Recall; }
+        public RecallPacket()
+        {
+            Type = PacketType.Recall;
+        }
     }
 }

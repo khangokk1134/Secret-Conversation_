@@ -1,7 +1,6 @@
 ﻿using System;
+using System.IO;
 using System.Net.Sockets;
-using System.Text;
-using System.Text.Json;
 using Protocol;
 
 namespace ChatServer
@@ -11,6 +10,10 @@ namespace ChatServer
         private readonly TcpClient _tcp;
         private readonly Server _server;
         private readonly NetworkStream _ns;
+
+        // serialize writes to NetworkStream (avoid packet interleaving)
+        private readonly object _writeLock = new();
+        private volatile bool _closed = false;
 
         public string? ClientId { get; private set; }
         public string? Username { get; private set; }
@@ -27,97 +30,79 @@ namespace ChatServer
         {
             try
             {
-                while (true)
+                while (!_closed)
                 {
-                    string? json = PacketIO.ReadJson(_ns);
+                    var json = PacketIO.ReadJson(_ns);   // length-prefixed
                     if (json == null) break;
 
-                    ProcessPacket(json);
+                    _server.Route(json, this);
                 }
             }
-            catch (IOException)
-            {
-                // Client closed connection normally → ignore
-            }
-            catch (ObjectDisposedException)
-            {
-                // Stream already disposed → ignore
-            }
+            catch (IOException) { }
+            catch (ObjectDisposedException) { }
             catch (Exception ex)
             {
                 Console.WriteLine("Client error: " + ex.Message);
             }
-
             finally
             {
-                if (!string.IsNullOrEmpty(ClientId))
-                    _server.Unregister(ClientId!);
+                if (!_closed && ClientId != null)
+                {
+                    try { _server.Unregister(ClientId); } catch { }
+                }
 
                 Close();
             }
         }
 
-        private void ProcessPacket(string json)
+        // Server sets identity after Register
+        public void SetIdentity(string clientId, string username, string pubKey)
         {
-            PacketBase? basePkt;
-            try { basePkt = JsonSerializer.Deserialize<PacketBase>(json); }
-            catch { return; }
-
-            if (basePkt == null) return;
-
-            switch (basePkt.Type)
-            {
-                case PacketType.Register:
-                    {
-                        var pkt = JsonSerializer.Deserialize<RegisterPacket>(json);
-                        if (pkt == null) return;
-
-                        ClientId = pkt.ClientId;
-                        Username = pkt.User;
-                        PublicKey = pkt.PublicKey;
-
-                        if (string.IsNullOrWhiteSpace(ClientId) ||
-                            string.IsNullOrWhiteSpace(Username) ||
-                            string.IsNullOrWhiteSpace(PublicKey))
-                            return;
-
-                        _server.Register(pkt.ClientId, pkt.User, pkt.PublicKey, this);
-                        break;
-                    }
-
-                case PacketType.GetPublicKey:
-                case PacketType.Chat:
-                case PacketType.Typing:
-                case PacketType.Logout:
-                case PacketType.Recall:
-                    _server.Route(json, this);
-                    break;
-
-                default:
-                    break;
-            }
-        }
-
-        public void SendPacket<T>(T packet)
-        {
-            try
-            {
-                PacketIO.SendPacket(_ns, packet);
-            }
-            catch { }
+            ClientId = clientId;
+            Username = username;
+            PublicKey = pubKey;
         }
 
         public void SendRaw(string json)
         {
+            if (_closed) return;
             try
             {
-                PacketIO.SendJson(_ns, json);
+                lock (_writeLock)
+                {
+                    if (_closed) return;
+                    PacketIO.SendJson(_ns, json);
+                }
             }
-            catch { }
+            catch
+            {
+                Close();
+            }
+        }
+
+        public void SendPacket<T>(T pkt)
+        {
+            if (_closed) return;
+            try
+            {
+                lock (_writeLock)
+                {
+                    if (_closed) return;
+                    PacketIO.SendPacket(_ns, pkt);
+                }
+            }
+            catch
+            {
+                Close();
+            }
         }
 
         public void Close()
         {
+            if (_closed) return;
+            _closed = true;
+
+            try { _ns.Close(); } catch { }
             try { _tcp.Close(); } catch { }
         }
     }

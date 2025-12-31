@@ -13,11 +13,10 @@ namespace ChatServer
         private readonly System.Threading.Thread _acceptThread;
         private bool _running;
 
-        // ONLINE
         private readonly ConcurrentDictionary<string, ClientConnection> _clients = new();
-        private readonly ConcurrentDictionary<string, string> _pubKeys = new();
+        private readonly ConcurrentDictionary<string, byte> _seenMessages = new();
 
-        // NEVER delete
+        private readonly ConcurrentDictionary<string, string> _pubKeys = new();
         private readonly ConcurrentDictionary<string, string> _userNames = new();
 
         private readonly string _offlineFolder = "offline";
@@ -65,7 +64,7 @@ namespace ChatServer
 
             _clients[clientId] = conn;
             _pubKeys[clientId] = pubKey;
-            _userNames.TryAdd(clientId, username);
+            _userNames[clientId] = username;
 
             Console.WriteLine($"Client online: {username} ({clientId})");
 
@@ -76,8 +75,6 @@ namespace ChatServer
         public void Unregister(string clientId)
         {
             _clients.TryRemove(clientId, out _);
-            _pubKeys.TryRemove(clientId, out _);
-
             Console.WriteLine($"Client offline: {clientId}");
             BroadcastUserList();
         }
@@ -106,6 +103,10 @@ namespace ChatServer
 
             switch (basePkt.Type)
             {
+                case PacketType.Register:
+                    RouteRegister(json, senderConn);
+                    break;
+
                 case PacketType.Chat:
                     RouteChat(json);
                     break;
@@ -125,7 +126,27 @@ namespace ChatServer
                 case PacketType.Recall:
                     RouteRecall(json);
                     break;
+
+                case PacketType.DeliveryReceipt:
+                    RouteDeliveryReceipt(json);
+                    break;
             }
+        }
+
+        private void RouteRegister(string json, ClientConnection conn)
+        {
+            RegisterPacket? pkt;
+            try { pkt = JsonSerializer.Deserialize<RegisterPacket>(json); }
+            catch { return; }
+            if (pkt == null) return;
+
+            if (string.IsNullOrEmpty(pkt.ClientId) ||
+                string.IsNullOrEmpty(pkt.User) ||
+                string.IsNullOrEmpty(pkt.PublicKey))
+                return;
+
+            conn.SetIdentity(pkt.ClientId, pkt.User, pkt.PublicKey);
+            Register(pkt.ClientId, pkt.User, pkt.PublicKey, conn);
         }
 
         private void RouteChat(string json)
@@ -135,16 +156,33 @@ namespace ChatServer
             catch { return; }
             if (pkt == null) return;
 
-            if (string.IsNullOrEmpty(pkt.FromId) || string.IsNullOrEmpty(pkt.ToId))
+            if (string.IsNullOrEmpty(pkt.MessageId) ||
+                string.IsNullOrEmpty(pkt.FromId) ||
+                string.IsNullOrEmpty(pkt.ToId))
                 return;
+
+            var seenKey = $"{pkt.FromId}:{pkt.ToId}:{pkt.MessageId}";
+            if (!_seenMessages.TryAdd(seenKey, 1))
+                return;
+
+            if (_clients.TryGetValue(pkt.FromId, out var sender0))
+            {
+                sender0.SendPacket(new ChatAckPacket
+                {
+                    MessageId = pkt.MessageId,
+                    FromId = pkt.FromId,
+                    ToId = pkt.ToId,
+                    Status = "accepted"
+                });
+            }
 
             if (_clients.TryGetValue(pkt.ToId, out var target))
             {
                 target.SendRaw(json);
 
-                if (_clients.TryGetValue(pkt.FromId, out var sender))
+                if (_clients.TryGetValue(pkt.FromId, out var sender1))
                 {
-                    sender.SendPacket(new ChatAckPacket
+                    sender1.SendPacket(new ChatAckPacket
                     {
                         MessageId = pkt.MessageId,
                         FromId = pkt.FromId,
@@ -157,17 +195,50 @@ namespace ChatServer
             {
                 StoreOffline(pkt.ToId, json);
 
-                if (_clients.TryGetValue(pkt.FromId, out var sender))
+                if (_clients.TryGetValue(pkt.FromId, out var sender2))
                 {
-                    sender.SendPacket(new ChatAckPacket
+                    sender2.SendPacket(new ChatAckPacket
                     {
                         MessageId = pkt.MessageId,
                         FromId = pkt.FromId,
                         ToId = pkt.ToId,
-                        Status = "offline"
+                        Status = "offline_saved"
                     });
                 }
             }
+        }
+
+        private void RouteDeliveryReceipt(string json)
+        {
+            DeliveryReceiptPacket? pkt;
+            try { pkt = JsonSerializer.Deserialize<DeliveryReceiptPacket>(json); }
+            catch { return; }
+            if (pkt == null) return;
+
+            if (string.IsNullOrEmpty(pkt.MessageId) ||
+                string.IsNullOrEmpty(pkt.FromId) ||
+                string.IsNullOrEmpty(pkt.ToId) ||
+                string.IsNullOrEmpty(pkt.Status))
+                return;
+
+            if (pkt.Status != "received")
+                return;
+
+            RemoveOfflineMessage(pkt.FromId, pkt.MessageId);
+
+            if (_clients.TryGetValue(pkt.ToId, out var sender))
+            {
+                sender.SendPacket(new ChatAckPacket
+                {
+                    MessageId = pkt.MessageId,
+                    FromId = pkt.ToId,
+                    ToId = pkt.FromId,
+                    Status = "delivered_to_client"
+                });
+            }
+
+            var idemKey = $"{pkt.ToId}:{pkt.FromId}:{pkt.MessageId}";
+            _seenMessages.TryRemove(idemKey, out _);
         }
 
         private void RouteTyping(string json)
@@ -177,8 +248,7 @@ namespace ChatServer
             catch { return; }
             if (pkt == null) return;
 
-            if (string.IsNullOrEmpty(pkt.ToId))
-                return;
+            if (string.IsNullOrEmpty(pkt.ToId)) return;
 
             if (_clients.TryGetValue(pkt.ToId, out var target))
                 target.SendRaw(json);
@@ -191,8 +261,7 @@ namespace ChatServer
             catch { return; }
             if (pkt == null) return;
 
-            if (string.IsNullOrEmpty(pkt.ClientId))
-                return;
+            if (string.IsNullOrEmpty(pkt.ClientId)) return;
 
             if (_pubKeys.TryGetValue(pkt.ClientId, out var key))
             {
@@ -223,29 +292,74 @@ namespace ChatServer
                 target.SendRaw(json);
         }
 
+        private string OfflineFile(string clientId) => Path.Combine(_offlineFolder, clientId + ".jsonl");
+
         private void StoreOffline(string clientId, string json)
         {
-            File.AppendAllText(
-                Path.Combine(_offlineFolder, clientId + ".jsonl"),
-                json + Environment.NewLine
-            );
+            File.AppendAllText(OfflineFile(clientId), json + Environment.NewLine);
         }
 
         private void DeliverOffline(string clientId, ClientConnection conn)
         {
-            string file = Path.Combine(_offlineFolder, clientId + ".jsonl");
+            var file = OfflineFile(clientId);
             if (!File.Exists(file)) return;
 
-            foreach (var line in File.ReadAllLines(file))
+            foreach (var line in File.ReadLines(file))
             {
                 if (string.IsNullOrWhiteSpace(line)) continue;
-
-                // đảm bảo gửi JSON sạch, không \n dư
-                var json = line.Trim();
-                conn.SendRaw(json);
+                conn.SendRaw(line.Trim());
             }
+        }
 
-            try { File.Delete(file); } catch { }
+        private void RemoveOfflineMessage(string receiverId, string messageId)
+        {
+            var file = OfflineFile(receiverId);
+            if (!File.Exists(file)) return;
+
+            try
+            {
+                var temp = file + ".tmp";
+                using var w = new StreamWriter(temp);
+
+                int kept = 0;
+                foreach (var line in File.ReadLines(file))
+                {
+                    if (string.IsNullOrWhiteSpace(line)) continue;
+
+                    var raw = line.Trim();
+                    bool remove = false;
+
+                    try
+                    {
+                        var pkt = JsonSerializer.Deserialize<ChatPacket>(raw);
+                        if (pkt?.MessageId == messageId) remove = true;
+                    }
+                    catch
+                    {
+                        remove = false;
+                    }
+
+                    if (remove) continue;
+
+                    w.WriteLine(raw);
+                    kept++;
+                }
+
+                w.Flush();
+                w.Close();
+
+                if (kept == 0)
+                {
+                    try { File.Delete(file); } catch { }
+                    try { File.Delete(temp); } catch { }
+                }
+                else
+                {
+                    File.Copy(temp, file, true);
+                    try { File.Delete(temp); } catch { }
+                }
+            }
+            catch { }
         }
     }
 }
