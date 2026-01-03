@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Net.Sockets;
 using System.Text.Json;
 using System.Threading;
@@ -39,12 +40,25 @@ namespace ChatClient
         readonly Dictionary<string, TaskCompletionSource<string>> _pubWaiters = new();
         readonly object _pubLock = new();
 
-        // user list
-        readonly Dictionary<string, string> _userNames = new();
+        // ===== User directory (from server UserList snapshot)
+        readonly Dictionary<string, string> _userNames = new(); // clientId -> username
+        readonly Dictionary<string, bool> _userOnline = new();  // clientId -> online
         string? _activePeerId = null;
+        string? _activePeerUser = null;
 
-        // message preview for ack display
-        readonly Dictionary<string, string> _sentMessagePreview = new();
+        // ===== Conversation UX (no new controls, reuse lstUsers)
+        readonly Dictionary<string, int> _unread = new();                 // peerId -> count
+        readonly Dictionary<string, (long ts, string preview)> _lastMsg = new(); // peerId -> last message
+        readonly object _convLock = new();
+
+        // ===== message preview/status (outgoing)
+        readonly Dictionary<string, string> _sentMessagePreview = new(); // msgId -> "Me → X: ..."
+        readonly Dictionary<string, string> _msgStatus = new();          // msgId -> accepted/delivered/offline_saved/delivered_to_client/timeout
+        readonly object _statusLock = new();
+
+        // ===== NEW: Track status token positions (avoid ACK spam lines)
+        readonly Dictionary<string, int> _statusTokenPos = new();
+        readonly object _statusTokenLock = new();
 
         // idempotent incoming
         readonly HashSet<string> _seenIncoming = new();
@@ -64,8 +78,13 @@ namespace ChatClient
         readonly object _pendingLock = new();
 
         System.Windows.Forms.Timer _resendTimer;
-        System.Windows.Forms.Timer _typingTimer;
-        string? _typingUser;
+
+        // ===== Typing (debounced, no spam)
+        System.Windows.Forms.Timer _typingUiClearTimer;   // clears typing line in UI after idle
+        System.Windows.Forms.Timer _typingSendDebounce;   // debounces outgoing typing packets
+        bool _typingSent = false;
+        long _lastTypedAtMs = 0;
+        string? _typingUser; // currently displayed typing user in rtbChat
 
         public RemoteClientForm()
         {
@@ -88,13 +107,24 @@ namespace ChatClient
                 File.WriteAllText(privPath, _privXml);
             }
 
-            _typingTimer = new System.Windows.Forms.Timer();
-            _typingTimer.Interval = 1500;
-            _typingTimer.Tick += (s, e) =>
+            // Typing UI clear (when remote typing stops)
+            _typingUiClearTimer = new System.Windows.Forms.Timer();
+            _typingUiClearTimer.Interval = 1500;
+            _typingUiClearTimer.Tick += (s, e) =>
             {
                 ClearTyping();
-                _typingTimer.Stop();
+                _typingUiClearTimer.Stop();
             };
+
+            // Typing debounce send (outgoing)
+            _typingSendDebounce = new System.Windows.Forms.Timer();
+            _typingSendDebounce.Interval = 350; // send at most ~3 packets/sec while typing
+            _typingSendDebounce.Tick += (s, e) =>
+            {
+                _typingSendDebounce.Stop();
+                TrySendTypingStart();
+            };
+
             txtMessage.TextChanged += TxtMessage_TextChanged;
 
             lstUsers.SelectedIndexChanged += (s, e) =>
@@ -102,7 +132,7 @@ namespace ChatClient
                 if (lstUsers.SelectedItem == null) return;
 
                 var display = lstUsers.SelectedItem.ToString()!;
-                var peerId = GetClientIdByName(display);
+                var peerId = GetClientIdByDisplay(display);
                 if (peerId == null) return;
 
                 // chặn chọn chính mình
@@ -112,11 +142,7 @@ namespace ChatClient
                     return;
                 }
 
-                var peerUser = display
-                    .Replace(" (offline)", "")
-                    .Replace(" (you)", "")
-                    .Trim();
-
+                var peerUser = ExtractNameFromDisplay(display);
                 SwitchConversation(peerId, peerUser);
             };
 
@@ -132,43 +158,38 @@ namespace ChatClient
         // ================= CONNECT (TOGGLE) =================
         private void btnConnect_Click(object sender, EventArgs e)
         {
-            // Toggle: đang connected -> bấm là disconnect
             if (IsReallyConnected())
             {
                 Disconnect("user");
                 return;
             }
 
-            // User explicitly clicks Connect => allow auto reconnect after this point
             _manualDisconnect = false;
-
-            // stop any previous reconnect loop
             StopReconnectLoop();
 
-            // reset trạng thái cũ
             _connected = false;
             InternalDisconnect("reset before connect", sendLogout: false);
 
-            // clear UI list trước khi connect để đỡ hiểu nhầm
             UI(() =>
             {
                 lstUsers.Items.Clear();
                 _userNames.Clear();
+                _userOnline.Clear();
             });
 
             _username = txtUser.Text.Trim();
             if (string.IsNullOrEmpty(_username)) return;
 
-            // remember endpoint for reconnect
             _serverIp = txtServerIP.Text.Trim();
-            if (!int.TryParse(txtPort.Text, out _serverPort))
-                return;
+            if (!int.TryParse(txtPort.Text, out _serverPort)) return;
 
             _clientId = LoadOrCreateClientId(_username);
 
+            // Load conversation previews/unread from history so lstUsers looks like "conversation list"
+            RebuildConversationSummariesFromDisk();
+
             _closing = false;
 
-            // Try connect once; on failure, start auto reconnect loop
             _ = Task.Run(async () =>
             {
                 var ok = await TryConnectOnceAsync(CancellationToken.None);
@@ -183,17 +204,16 @@ namespace ChatClient
         {
             if (_closing) return;
 
-            // user initiated disconnect => do not auto reconnect
             _manualDisconnect = true;
             StopReconnectLoop();
 
             InternalDisconnect(reason, sendLogout: true);
 
-            // clear users khi disconnect để nhìn rõ trạng thái
             UI(() =>
             {
                 lstUsers.Items.Clear();
                 _userNames.Clear();
+                _userOnline.Clear();
             });
 
             UI(() => rtbChat.AppendText($"[Disconnected: {reason}]\n"));
@@ -204,7 +224,11 @@ namespace ChatClient
             _connected = false;
 
             try { _resendTimer.Stop(); } catch { }
-            try { _typingTimer.Stop(); } catch { }
+            try { _typingUiClearTimer.Stop(); } catch { }
+            try { _typingSendDebounce.Stop(); } catch { }
+
+            // reset outgoing typing state
+            _typingSent = false;
 
             lock (_pubLock)
             {
@@ -215,7 +239,6 @@ namespace ChatClient
 
             try { ClearTyping(); } catch { }
 
-            // best-effort logout
             if (sendLogout)
             {
                 try
@@ -235,9 +258,7 @@ namespace ChatClient
             SetUiConnected(false);
         }
 
-        // Backward-compatible wrapper for existing calls
-        private void InternalDisconnect(string reason)
-            => InternalDisconnect(reason, sendLogout: true);
+        private void InternalDisconnect(string reason) => InternalDisconnect(reason, sendLogout: true);
 
         // ================= RECONNECT =================
         private void StartReconnectLoop(string reason)
@@ -246,7 +267,7 @@ namespace ChatClient
             if (_manualDisconnect) return;
 
             if (Interlocked.Exchange(ref _reconnectRunning, 1) == 1)
-                return; // already running
+                return;
 
             StopReconnectLoop();
             _reconnectCts = new CancellationTokenSource();
@@ -256,7 +277,6 @@ namespace ChatClient
 
             _ = Task.Run(async () =>
             {
-                // backoff sequence (ms)
                 int[] delays = new[] { 1000, 2000, 5000, 10000, 20000 };
                 int idx = 0;
 
@@ -277,7 +297,6 @@ namespace ChatClient
                         if (token.IsCancellationRequested || _closing || _manualDisconnect)
                             break;
 
-                        // cleanup any dead sockets before retry
                         InternalDisconnect("reconnect cleanup", sendLogout: false);
 
                         var ok = await TryConnectOnceAsync(token);
@@ -318,7 +337,6 @@ namespace ChatClient
 
                 var tcp = new TcpClient();
 
-                // Connect with cancellation via Task.WhenAny
                 var connectTask = tcp.ConnectAsync(_serverIp, _serverPort);
                 var done = await Task.WhenAny(connectTask, Task.Delay(8000, token));
                 if (done != connectTask)
@@ -327,7 +345,6 @@ namespace ChatClient
                     return false;
                 }
 
-                // propagate connect exceptions
                 await connectTask;
 
                 var ns = tcp.GetStream();
@@ -338,7 +355,7 @@ namespace ChatClient
                 _connected = true;
                 SetUiConnected(true);
 
-                // Register
+                // Register again after reconnect
                 SendPacket(new RegisterPacket
                 {
                     ClientId = _clientId,
@@ -346,7 +363,6 @@ namespace ChatClient
                     PublicKey = _pubXml
                 });
 
-                // start receive loop
                 _recvThread = new Thread(ReceiveLoop) { IsBackground = true };
                 _recvThread.Start();
 
@@ -379,7 +395,7 @@ namespace ChatClient
                     }
                     catch
                     {
-                        break; // socket closed
+                        break;
                     }
 
                     if (json == null) break;
@@ -428,49 +444,102 @@ namespace ChatClient
                     InternalDisconnect("socket closed", sendLogout: false);
                     UI(() => rtbChat.AppendText("[Disconnected: socket closed]\n"));
 
-                    // auto reconnect unless user manually disconnected
                     if (!_manualDisconnect)
                         StartReconnectLoop("socket closed");
                 }
             }
         }
 
-        // ================= USER LIST =================
+        // ================= USER LIST (render as conversation-ish list) =================
         void HandleUserList(UserListPacket pkt)
         {
             if (pkt?.Users == null) return;
 
+            lock (_convLock)
+            {
+                _userNames.Clear();
+                _userOnline.Clear();
+
+                foreach (var u in pkt.Users)
+                {
+                    if (string.IsNullOrEmpty(u.ClientId)) continue;
+                    _userNames[u.ClientId] = u.User ?? "";
+                    _userOnline[u.ClientId] = u.Online;
+                }
+            }
+
+            RefreshUserListUi();
+        }
+
+        void RefreshUserListUi()
+        {
             UI(() =>
             {
                 lstUsers.BeginUpdate();
                 try
                 {
                     lstUsers.Items.Clear();
-                    _userNames.Clear();
 
-                    foreach (var u in pkt.Users)
+                    List<(string id, string name)> users;
+                    lock (_convLock)
                     {
-                        if (string.IsNullOrEmpty(u.ClientId)) continue;
-                        _userNames[u.ClientId] = u.User ?? "";
+                        users = _userNames
+                            .Select(kv => (id: kv.Key, name: kv.Value))
+                            .OrderBy(x => x.name, StringComparer.OrdinalIgnoreCase)
+                            .ToList();
+                    }
 
-                        // ✅ HIỂN THỊ CHÍNH MÌNH để khỏi “trống list” khi chỉ có 1 client
-                        if (u.ClientId == _clientId)
+                    if (users.Count == 0)
+                    {
+                        lstUsers.Items.Add("(no users)");
+                        return;
+                    }
+
+                    foreach (var (id, name) in users)
+                    {
+                        // show self too
+                        if (id == _clientId)
                         {
-                            lstUsers.Items.Add($"{u.User} (you)");
+                            lstUsers.Items.Add($"{name} (you)");
                             continue;
                         }
 
-                        lstUsers.Items.Add(u.Online ? u.User : $"{u.User} (offline)");
-                    }
+                        bool online = false;
+                        int unread = 0;
+                        (long ts, string preview) last = default;
 
-                    if (lstUsers.Items.Count == 0)
-                        lstUsers.Items.Add("(no users)");
+                        lock (_convLock)
+                        {
+                            online = _userOnline.TryGetValue(id, out var on) && on;
+                            unread = _unread.TryGetValue(id, out var c) ? c : 0;
+                            last = _lastMsg.TryGetValue(id, out var lm) ? lm : (0, "");
+                        }
+
+                        string badge = unread > 0 ? $" ({unread})" : "";
+                        string status = online ? "" : " (offline)";
+
+                        // lightweight preview: " - lastMessage (HH:mm)"
+                        string previewPart = "";
+                        if (last.ts > 0 && !string.IsNullOrWhiteSpace(last.preview))
+                        {
+                            var t = DateTimeOffset.FromUnixTimeMilliseconds(last.ts).ToLocalTime();
+                            previewPart = $" - {TrimPreview(last.preview, 22)} ({t:HH:mm})";
+                        }
+
+                        lstUsers.Items.Add($"{name}{status}{badge}{previewPart}");
+                    }
                 }
                 finally
                 {
                     lstUsers.EndUpdate();
                 }
             });
+        }
+
+        static string TrimPreview(string s, int max)
+        {
+            s = s.Replace("\r", " ").Replace("\n", " ").Trim();
+            return s.Length <= max ? s : s.Substring(0, max - 1) + "…";
         }
 
         // ================= PUBLIC KEY =================
@@ -569,15 +638,28 @@ namespace ChatClient
 
             SendReceipt(pkt);
 
+            // Save history
+            var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             SaveHistory(new ChatLogEntry
             {
-                Ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                Ts = now,
                 Dir = "in",
                 PeerId = pkt.FromId,
                 PeerUser = pkt.FromUser,
                 Text = plain,
                 MessageId = pkt.MessageId ?? ""
             });
+
+            // Update conversation preview + unread
+            lock (_convLock)
+            {
+                _lastMsg[pkt.FromId] = (now, plain);
+
+                if (_activePeerId != pkt.FromId)
+                {
+                    _unread[pkt.FromId] = (_unread.TryGetValue(pkt.FromId, out var c) ? c : 0) + 1;
+                }
+            }
 
             var suffix = "";
             if (!hasPub) suffix = " [UNVERIFIED]";
@@ -586,7 +668,9 @@ namespace ChatClient
             if (_activePeerId == pkt.FromId)
                 UI(() => rtbChat.AppendText($"{pkt.FromUser}: {plain}{suffix}\n"));
             else
-                ShowNewMessageHint(pkt.FromUser);
+                UI(() => rtbChat.AppendText($"[New message from {pkt.FromUser}] (click user to view)\n"));
+
+            RefreshUserListUi();
         }
 
         void SendReceipt(ChatPacket pkt)
@@ -616,13 +700,14 @@ namespace ChatClient
                 return;
             }
 
-            if (lstUsers.SelectedItem == null) return;
+            if (_activePeerId == null || _activePeerUser == null)
+            {
+                MessageBox.Show("Select a user to chat.");
+                return;
+            }
 
-            var display = lstUsers.SelectedItem.ToString()!;
-            var toId = GetClientIdByName(display);
-            if (toId == null) return;
+            var toId = _activePeerId;
 
-            // chặn gửi cho chính mình
             if (toId == _clientId)
             {
                 MessageBox.Show("Cannot send to yourself.");
@@ -645,20 +730,21 @@ namespace ChatClient
             var encKey = CryptoHelper.RsaEncryptBase64(Convert.ToBase64String(aes), pub);
             var sig = CryptoHelper.SignData(plain, _privXml);
 
+            var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
             var pkt = new ChatPacket
             {
                 MessageId = msgId,
-                Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                Timestamp = now,
                 FromId = _clientId,
                 FromUser = _username!,
                 ToId = toId,
-                ToUser = display.Replace(" (offline)", "").Replace(" (you)", "").Trim(),
+                ToUser = _activePeerUser,
                 EncKey = encKey,
                 EncMsg = encMsg,
                 Sig = sig
             };
 
-            var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             lock (_pendingLock)
             {
                 _pending[msgId] = new PendingMsg
@@ -671,6 +757,8 @@ namespace ChatClient
                 };
             }
 
+            SetStatus(msgId, "new", persistToHistory: false);
+
             SendPacket(pkt);
 
             SaveHistory(new ChatLogEntry
@@ -678,16 +766,42 @@ namespace ChatClient
                 Ts = now,
                 Dir = "out",
                 PeerId = toId,
-                PeerUser = display.Replace(" (offline)", "").Replace(" (you)", "").Trim(),
+                PeerUser = _activePeerUser,
                 Text = plain,
                 MessageId = msgId
             });
 
-            _sentMessagePreview[msgId] = $"Me → {display}: {plain}";
-            UI(() => rtbChat.AppendText($"Me → {display}: {plain}\n"));
+            lock (_convLock)
+            {
+                _lastMsg[toId] = (now, plain);
+            }
+
+            _sentMessagePreview[msgId] = $"Me → {_activePeerUser}: {plain}";
+
+            // ===== IMPORTANT: append only ONE line with fixed status token, store token position
+            UI(() =>
+            {
+                var line = $"Me → {_activePeerUser}: {plain} {StatusToken("new")}\n";
+                int start = rtbChat.TextLength;
+                rtbChat.AppendText(line);
+
+                // token is last 5 chars before '\n'
+                int tokenPos = start + line.Length - 1 - 5;
+                lock (_statusTokenLock)
+                {
+                    _statusTokenPos[msgId] = tokenPos;
+                }
+
+                rtbChat.ScrollToCaret();
+            });
+
+            RefreshUserListUi();
             txtMessage.Clear();
+
+            TrySendTypingStop();
         }
 
+        // ================= ACK / STATUS =================
         void HandleChatAck(ChatAckPacket pkt)
         {
             if (pkt == null) return;
@@ -703,44 +817,121 @@ namespace ChatClient
                 }
             }
 
-            UI(() =>
-            {
-                var text = _sentMessagePreview.TryGetValue(pkt.MessageId, out var preview)
-                    ? preview
-                    : "(unknown message)";
+            // Persist status to history
+            SetStatus(pkt.MessageId, pkt.Status ?? "", persistToHistory: true);
 
-                if (pkt.Status == "accepted")
-                    rtbChat.AppendText($"[✓ Server accepted] {text}\n");
-                else if (pkt.Status == "offline_saved")
-                    rtbChat.AppendText($"[⚠ Offline – saved] {text}\n");
-                else if (pkt.Status == "delivered")
-                    rtbChat.AppendText($"[✓ Delivered to receiver socket] {text}\n");
-                else if (pkt.Status == "delivered_to_client")
-                    rtbChat.AppendText($"[✓ Delivered to client (2-way ACK)] {text}\n");
-                else
-                    rtbChat.AppendText($"[ACK {pkt.Status}] {text}\n");
-            });
+            // ===== IMPORTANT: do NOT append ACK lines; update token in place
+            UpdateStatusTokenInChatBox(pkt.MessageId, pkt.Status ?? "");
         }
 
         void HandleDeliveryReceipt(DeliveryReceiptPacket pkt)
         {
+            // Compatibility: currently you don't really receive this as delivered_to_client from server,
+            // but keep it for future.
             if (pkt == null) return;
             if (string.IsNullOrEmpty(pkt.MessageId)) return;
 
-            if (pkt.Status == "delivered_to_client")
+            if (!string.IsNullOrEmpty(pkt.Status))
             {
-                lock (_pendingLock) { _pending.Remove(pkt.MessageId); }
+                SetStatus(pkt.MessageId, pkt.Status, persistToHistory: true);
+                UpdateStatusTokenInChatBox(pkt.MessageId, pkt.Status);
+            }
+        }
+
+        string GetStatus(string msgId)
+        {
+            lock (_statusLock)
+                return _msgStatus.TryGetValue(msgId, out var s) ? s : "";
+        }
+
+        void SetStatus(string msgId, string status, bool persistToHistory)
+        {
+            if (string.IsNullOrEmpty(msgId)) return;
+            if (string.IsNullOrEmpty(status)) return;
+
+            bool changed = false;
+            lock (_statusLock)
+            {
+                if (!_msgStatus.TryGetValue(msgId, out var old) || old != status)
+                {
+                    _msgStatus[msgId] = status;
+                    changed = true;
+                }
+            }
+
+            if (!changed) return;
+
+            if (persistToHistory)
+            {
+                string peerId = "";
+                string peerUser = "";
+
+                lock (_pendingLock)
+                {
+                    if (_pending.TryGetValue(msgId, out var p))
+                    {
+                        peerId = p.Packet.ToId;
+                        peerUser = p.Packet.ToUser;
+                    }
+                }
+
+                if (string.IsNullOrEmpty(peerId))
+                {
+                    peerId = _activePeerId ?? "";
+                    peerUser = _activePeerUser ?? "";
+                }
+
+                SaveHistory(new ChatLogEntry
+                {
+                    Ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                    Dir = "status",
+                    PeerId = peerId,
+                    PeerUser = peerUser,
+                    Text = "",
+                    MessageId = msgId,
+                    Status = status
+                });
+            }
+        }
+
+        // ===== NEW: fixed-length status tokens (5 chars)
+        static string StatusToken(string? status)
+        {
+            return status switch
+            {
+                "accepted" => "[✓  ]",
+                "delivered" => "[✓✓ ]",
+                "offline_saved" => "[⚠  ]",
+                "delivered_to_client" => "[✓✓✓]",
+                "timeout" => "[⏱  ]",
+                "new" => "[...]",
+                _ => "[...]"
+            };
+        }
+
+        void UpdateStatusTokenInChatBox(string msgId, string status)
+        {
+            int pos;
+            lock (_statusTokenLock)
+            {
+                if (!_statusTokenPos.TryGetValue(msgId, out pos))
+                    return;
             }
 
             UI(() =>
             {
-                var text = _sentMessagePreview.TryGetValue(pkt.MessageId, out var preview)
-                    ? preview
-                    : "(unknown message)";
-                rtbChat.AppendText($"[Receipt {pkt.Status}] {text}\n");
+                try
+                {
+                    rtbChat.Select(pos, 5);
+                    rtbChat.SelectedText = StatusToken(status);
+                    rtbChat.Select(rtbChat.TextLength, 0);
+                    rtbChat.ScrollToCaret();
+                }
+                catch { }
             });
         }
 
+        // ================= RESEND =================
         void ResendTick()
         {
             if (_closing) return;
@@ -758,13 +949,17 @@ namespace ChatClient
                     if (p.Stage == "delivered_to_client" || p.Stage == "timeout")
                         continue;
 
+                    int interval = (p.Stage == "offline_saved") ? 12_000 : 3_000;
+
                     if (now - p.FirstSentMs > 120_000)
                     {
                         p.Stage = "timeout";
+                        SetStatus(p.Packet.MessageId ?? "", "timeout", persistToHistory: true);
+                        UpdateStatusTokenInChatBox(p.Packet.MessageId ?? "", "timeout");
                         continue;
                     }
 
-                    if (now - p.LastSentMs >= 3000 && p.Attempts < 6)
+                    if (now - p.LastSentMs >= interval && p.Attempts < 6)
                     {
                         p.Attempts++;
                         p.LastSentMs = now;
@@ -780,41 +975,96 @@ namespace ChatClient
             }
         }
 
+        // ================= RECALL =================
         void HandleRecall(RecallPacket pkt)
         {
             UI(() => rtbChat.AppendText($"[Message recalled] id={pkt.MessageId}\n"));
         }
 
+        // ================= TYPING (debounced) =================
         void TxtMessage_TextChanged(object? sender, EventArgs e)
         {
+            _lastTypedAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
             if (!IsReallyConnected()) return;
-            if (lstUsers.SelectedItem == null) return;
+            if (_activePeerId == null) return;
+            if (_activePeerId == _clientId) return;
 
-            var toId = GetClientIdByName(lstUsers.SelectedItem.ToString()!);
-            if (toId == null) return;
-            if (toId == _clientId) return;
+            _typingSendDebounce.Stop();
+            _typingSendDebounce.Start();
 
-            SendPacket(new TypingPacket
+            _ = Task.Run(async () =>
             {
-                FromId = _clientId,
-                FromUser = _username!,
-                ToId = toId,
-                IsTyping = true
-            });
+                var mark = _lastTypedAtMs;
+                await Task.Delay(1200);
+                if (_closing) return;
+                if (!IsReallyConnected()) return;
+                if (_activePeerId == null) return;
 
-            _typingTimer.Stop();
-            _typingTimer.Start();
+                if (_lastTypedAtMs == mark)
+                    TrySendTypingStop();
+            });
+        }
+
+        void TrySendTypingStart()
+        {
+            if (!IsReallyConnected()) return;
+            if (_activePeerId == null) return;
+            if (_activePeerId == _clientId) return;
+            if (_typingSent) return;
+
+            _typingSent = true;
+            try
+            {
+                SendPacket(new TypingPacket
+                {
+                    FromId = _clientId,
+                    FromUser = _username!,
+                    ToId = _activePeerId,
+                    IsTyping = true
+                });
+            }
+            catch { }
+        }
+
+        void TrySendTypingStop()
+        {
+            if (!IsReallyConnected()) { _typingSent = false; return; }
+            if (_activePeerId == null) { _typingSent = false; return; }
+            if (!_typingSent) return;
+
+            _typingSent = false;
+            try
+            {
+                SendPacket(new TypingPacket
+                {
+                    FromId = _clientId,
+                    FromUser = _username!,
+                    ToId = _activePeerId,
+                    IsTyping = false
+                });
+            }
+            catch { }
         }
 
         void HandleTyping(TypingPacket pkt)
         {
             UI(() =>
             {
+                if (_activePeerId == null) return;
+                if (pkt.FromId != _activePeerId) return;
+
                 ClearTyping();
                 if (pkt.IsTyping)
                 {
                     _typingUser = pkt.FromUser;
                     rtbChat.AppendText($"[{pkt.FromUser} is typing...]\n");
+                    _typingUiClearTimer.Stop();
+                    _typingUiClearTimer.Start();
+                }
+                else
+                {
+                    ClearTyping();
                 }
             });
         }
@@ -826,6 +1076,7 @@ namespace ChatClient
             _typingUser = null;
         }
 
+        // ================= SEND PACKET =================
         void SendPacket<T>(T pkt)
         {
             var ns = _ns;
@@ -833,19 +1084,44 @@ namespace ChatClient
             PacketIO.SendPacket(ns, pkt);
         }
 
-        string? GetClientIdByName(string display)
+        // ================= DISPLAY ↔ ID HELPERS =================
+        static string ExtractNameFromDisplay(string display)
         {
-            var name = display
-                .Replace(" (offline)", "")
-                .Replace(" (you)", "")
-                .Trim();
+            var s = display;
 
-            foreach (var kv in _userNames)
-                if (kv.Value == name)
-                    return kv.Key;
+            var dash = s.IndexOf(" - ");
+            if (dash >= 0) s = s.Substring(0, dash);
+
+            s = s.Replace(" (offline)", "")
+                 .Replace(" (you)", "")
+                 .Trim();
+
+            int lastOpen = s.LastIndexOf(" (");
+            int lastClose = s.LastIndexOf(")");
+            if (lastOpen >= 0 && lastClose == s.Length - 1 && lastOpen < lastClose)
+            {
+                var inside = s.Substring(lastOpen + 2, lastClose - (lastOpen + 2));
+                if (int.TryParse(inside, out _))
+                    s = s.Substring(0, lastOpen).Trim();
+            }
+
+            return s;
+        }
+
+        string? GetClientIdByDisplay(string display)
+        {
+            var name = ExtractNameFromDisplay(display);
+
+            lock (_convLock)
+            {
+                foreach (var kv in _userNames)
+                    if (kv.Value == name)
+                        return kv.Key;
+            }
             return null;
         }
 
+        // ================= HISTORY =================
         private string LoadOrCreateClientId(string username)
         {
             Directory.CreateDirectory("keys");
@@ -871,7 +1147,7 @@ namespace ChatClient
         class ChatLogEntry
         {
             public long Ts { get; set; }
-            public string Dir { get; set; } = "";
+            public string Dir { get; set; } = "";   // in/out/status
             public string PeerId { get; set; } = "";
             public string PeerUser { get; set; } = "";
             public string Text { get; set; } = "";
@@ -890,38 +1166,91 @@ namespace ChatClient
         {
             try
             {
+                if (string.IsNullOrEmpty(e.PeerId)) return;
                 var file = GetHistoryFile(e.PeerId);
                 File.AppendAllText(file, JsonSerializer.Serialize(e) + Environment.NewLine);
             }
             catch { }
         }
 
-        void LoadHistoryToChatBox(string peerId)
+        void LoadHistoryToChatBox(string peerId, string peerUser)
         {
             try
             {
                 var file = GetHistoryFile(peerId);
 
-                UI(() => rtbChat.Clear());
+                UI(() =>
+                {
+                    rtbChat.Clear();
+                    // Reset token mapping for current view
+                    lock (_statusTokenLock)
+                    {
+                        _statusTokenPos.Clear();
+                    }
+                });
 
-                if (!File.Exists(file)) return;
+                if (!File.Exists(file))
+                {
+                    UI(() => rtbChat.AppendText($"--- Chat with {peerUser} ---\n"));
+                    return;
+                }
 
+                var entries = new List<ChatLogEntry>();
                 foreach (var line in File.ReadLines(file))
                 {
                     if (string.IsNullOrWhiteSpace(line)) continue;
-
-                    ChatLogEntry? e = null;
-                    try { e = JsonSerializer.Deserialize<ChatLogEntry>(line); }
-                    catch { continue; }
-                    if (e == null) continue;
-
-                    if (e.Dir == "out")
-                        UI(() => rtbChat.AppendText($"Me → {e.PeerUser}: {e.Text}\n"));
-                    else if (e.Dir == "in")
-                        UI(() => rtbChat.AppendText($"{e.PeerUser}: {e.Text}\n"));
-                    else if (e.Dir == "status")
-                        UI(() => rtbChat.AppendText($"[{e.Status}] {e.Text}\n"));
+                    try
+                    {
+                        var e = JsonSerializer.Deserialize<ChatLogEntry>(line);
+                        if (e != null) entries.Add(e);
+                    }
+                    catch { }
                 }
+
+                var statusByMsg = new Dictionary<string, string>();
+                foreach (var e in entries)
+                {
+                    if (e.Dir == "status" && !string.IsNullOrEmpty(e.MessageId) && !string.IsNullOrEmpty(e.Status))
+                        statusByMsg[e.MessageId] = e.Status;
+                }
+
+                UI(() => rtbChat.AppendText($"--- Chat with {peerUser} ---\n"));
+
+                foreach (var e in entries)
+                {
+                    if (e.Dir == "out")
+                    {
+                        var st = (!string.IsNullOrEmpty(e.MessageId) && statusByMsg.TryGetValue(e.MessageId, out var s))
+                            ? s
+                            : "new";
+
+                        UI(() =>
+                        {
+                            var line = $"Me → {peerUser}: {e.Text} {StatusToken(st)}\n";
+                            int start = rtbChat.TextLength;
+                            rtbChat.AppendText(line);
+
+                            if (!string.IsNullOrEmpty(e.MessageId))
+                            {
+                                int tokenPos = start + line.Length - 1 - 5;
+                                lock (_statusTokenLock)
+                                {
+                                    _statusTokenPos[e.MessageId] = tokenPos;
+                                }
+                            }
+                        });
+                    }
+                    else if (e.Dir == "in")
+                    {
+                        UI(() => rtbChat.AppendText($"{peerUser}: {e.Text}\n"));
+                    }
+                }
+
+                UI(() =>
+                {
+                    rtbChat.Select(rtbChat.TextLength, 0);
+                    rtbChat.ScrollToCaret();
+                });
             }
             catch { }
         }
@@ -929,23 +1258,64 @@ namespace ChatClient
         void SwitchConversation(string peerId, string peerUser)
         {
             _activePeerId = peerId;
-            LoadHistoryToChatBox(peerId);
-            UI(() => rtbChat.AppendText($"--- Chat with {peerUser} ---\n"));
+            _activePeerUser = peerUser;
+
+            lock (_convLock)
+            {
+                _unread[peerId] = 0;
+            }
+
+            LoadHistoryToChatBox(peerId, peerUser);
+
+            RefreshUserListUi();
+
+            TrySendTypingStop();
         }
 
-        void ShowNewMessageHint(string fromUser)
+        void RebuildConversationSummariesFromDisk()
         {
-            UI(() => rtbChat.AppendText($"[New message from {fromUser}] (click user to view)\n"));
+            try
+            {
+                if (string.IsNullOrEmpty(_clientId)) return;
+
+                var root = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "history", _clientId);
+                Directory.CreateDirectory(root);
+
+                lock (_convLock)
+                {
+                    _lastMsg.Clear();
+                }
+
+                foreach (var file in Directory.EnumerateFiles(root, "*.jsonl"))
+                {
+                    var peerId = Path.GetFileNameWithoutExtension(file);
+                    ChatLogEntry? last = null;
+
+                    foreach (var line in File.ReadLines(file))
+                    {
+                        if (string.IsNullOrWhiteSpace(line)) continue;
+                        try
+                        {
+                            var e = JsonSerializer.Deserialize<ChatLogEntry>(line);
+                            if (e != null && (e.Dir == "in" || e.Dir == "out"))
+                                last = e;
+                        }
+                        catch { }
+                    }
+
+                    if (last != null)
+                    {
+                        lock (_convLock)
+                        {
+                            _lastMsg[peerId] = (last.Ts, last.Text);
+                        }
+                    }
+                }
+            }
+            catch { }
         }
 
-        // Designer stubs
-        private void btnGetPubKey_Click(object sender, EventArgs e) { }
-        private void rtbChat_TextChanged(object sender, EventArgs e) { }
-        private void txtServerIP_TextChanged(object sender, EventArgs e) { }
-        private void label2_Click(object sender, EventArgs e) { }
-        private void txtPort_TextChanged(object sender, EventArgs e) { }
-        private void txtUser_TextChanged(object sender, EventArgs e) { }
-
+        // ================= UI HELPERS =================
         private void UI(Action a)
         {
             if (InvokeRequired) BeginInvoke(a);
@@ -984,5 +1354,13 @@ namespace ChatClient
                 txtUser.Enabled = !connected;
             });
         }
+
+        // Designer stubs
+        private void btnGetPubKey_Click(object sender, EventArgs e) { }
+        private void rtbChat_TextChanged(object sender, EventArgs e) { }
+        private void txtServerIP_TextChanged(object sender, EventArgs e) { }
+        private void label2_Click(object sender, EventArgs e) { }
+        private void txtPort_TextChanged(object sender, EventArgs e) { }
+        private void txtUser_TextChanged(object sender, EventArgs e) { }
     }
 }

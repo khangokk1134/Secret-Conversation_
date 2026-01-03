@@ -9,7 +9,7 @@ namespace ChatClient
         static void Main()
         {
             ApplicationConfiguration.Initialize();
-            Application.Run(new RemoteClientForm());
+            Application.Run(new ChatAppForm());
         }
     }
 }
