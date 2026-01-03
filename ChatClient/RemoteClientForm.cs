@@ -19,6 +19,17 @@ namespace ChatClient
         volatile bool _closing = false;
         volatile bool _connected = false;
 
+        // user pressed Disconnect => do not auto reconnect
+        volatile bool _manualDisconnect = false;
+
+        // reconnect loop control
+        CancellationTokenSource? _reconnectCts;
+        int _reconnectRunning = 0;
+
+        // remember last endpoint for reconnect
+        string _serverIp = "";
+        int _serverPort = 5000;
+
         string _clientId = "";
         string? _username;
 
@@ -128,9 +139,15 @@ namespace ChatClient
                 return;
             }
 
+            // User explicitly clicks Connect => allow auto reconnect after this point
+            _manualDisconnect = false;
+
+            // stop any previous reconnect loop
+            StopReconnectLoop();
+
             // reset trạng thái cũ
             _connected = false;
-            InternalDisconnect("reset before connect");
+            InternalDisconnect("reset before connect", sendLogout: false);
 
             // clear UI list trước khi connect để đỡ hiểu nhầm
             UI(() =>
@@ -142,45 +159,35 @@ namespace ChatClient
             _username = txtUser.Text.Trim();
             if (string.IsNullOrEmpty(_username)) return;
 
+            // remember endpoint for reconnect
+            _serverIp = txtServerIP.Text.Trim();
+            if (!int.TryParse(txtPort.Text, out _serverPort))
+                return;
+
             _clientId = LoadOrCreateClientId(_username);
 
-            try
+            _closing = false;
+
+            // Try connect once; on failure, start auto reconnect loop
+            _ = Task.Run(async () =>
             {
-                _closing = false;
-
-                _tcp = new TcpClient();
-                _tcp.Connect(txtServerIP.Text.Trim(), int.Parse(txtPort.Text));
-                _ns = _tcp.GetStream();
-
-                _connected = true;
-                SetUiConnected(true);
-
-                SendPacket(new RegisterPacket
+                var ok = await TryConnectOnceAsync(CancellationToken.None);
+                if (!ok && !_closing && !_manualDisconnect)
                 {
-                    ClientId = _clientId,
-                    User = _username!,
-                    PublicKey = _pubXml
-                });
-
-                _recvThread = new Thread(ReceiveLoop) { IsBackground = true };
-                _recvThread.Start();
-
-                _resendTimer.Start();
-
-                UI(() => rtbChat.AppendText("[Connected]\n"));
-            }
-            catch (Exception ex)
-            {
-                InternalDisconnect("connect failed");
-                UI(() => rtbChat.AppendText("[ERROR] " + ex.Message + "\n"));
-            }
+                    StartReconnectLoop("connect failed");
+                }
+            });
         }
 
         private void Disconnect(string reason)
         {
             if (_closing) return;
 
-            InternalDisconnect(reason);
+            // user initiated disconnect => do not auto reconnect
+            _manualDisconnect = true;
+            StopReconnectLoop();
+
+            InternalDisconnect(reason, sendLogout: true);
 
             // clear users khi disconnect để nhìn rõ trạng thái
             UI(() =>
@@ -192,7 +199,7 @@ namespace ChatClient
             UI(() => rtbChat.AppendText($"[Disconnected: {reason}]\n"));
         }
 
-        private void InternalDisconnect(string reason)
+        private void InternalDisconnect(string reason, bool sendLogout)
         {
             _connected = false;
 
@@ -209,12 +216,15 @@ namespace ChatClient
             try { ClearTyping(); } catch { }
 
             // best-effort logout
-            try
+            if (sendLogout)
             {
-                if (_ns != null && !string.IsNullOrEmpty(_clientId))
-                    SendPacket(new LogoutPacket { ClientId = _clientId });
+                try
+                {
+                    if (_ns != null && !string.IsNullOrEmpty(_clientId))
+                        SendPacket(new LogoutPacket { ClientId = _clientId });
+                }
+                catch { }
             }
-            catch { }
 
             try { _ns?.Close(); } catch { }
             try { _tcp?.Close(); } catch { }
@@ -223,6 +233,133 @@ namespace ChatClient
             _tcp = null;
 
             SetUiConnected(false);
+        }
+
+        // Backward-compatible wrapper for existing calls
+        private void InternalDisconnect(string reason)
+            => InternalDisconnect(reason, sendLogout: true);
+
+        // ================= RECONNECT =================
+        private void StartReconnectLoop(string reason)
+        {
+            if (_closing) return;
+            if (_manualDisconnect) return;
+
+            if (Interlocked.Exchange(ref _reconnectRunning, 1) == 1)
+                return; // already running
+
+            StopReconnectLoop();
+            _reconnectCts = new CancellationTokenSource();
+            var token = _reconnectCts.Token;
+
+            UI(() => rtbChat.AppendText($"[Auto-reconnect started: {reason}]\n"));
+
+            _ = Task.Run(async () =>
+            {
+                // backoff sequence (ms)
+                int[] delays = new[] { 1000, 2000, 5000, 10000, 20000 };
+                int idx = 0;
+
+                try
+                {
+                    while (!token.IsCancellationRequested && !_closing && !_manualDisconnect)
+                    {
+                        if (IsReallyConnected())
+                            break;
+
+                        int delay = delays[Math.Min(idx, delays.Length - 1)];
+                        if (idx < delays.Length - 1) idx++;
+
+                        UI(() => rtbChat.AppendText($"[Reconnecting in {delay / 1000.0:0.#}s...]\n"));
+                        try { await Task.Delay(delay, token); }
+                        catch { break; }
+
+                        if (token.IsCancellationRequested || _closing || _manualDisconnect)
+                            break;
+
+                        // cleanup any dead sockets before retry
+                        InternalDisconnect("reconnect cleanup", sendLogout: false);
+
+                        var ok = await TryConnectOnceAsync(token);
+                        if (ok)
+                        {
+                            UI(() => rtbChat.AppendText("[Reconnected]\n"));
+                            break;
+                        }
+                    }
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _reconnectRunning, 0);
+                }
+            }, token);
+        }
+
+        private void StopReconnectLoop()
+        {
+            try
+            {
+                _reconnectCts?.Cancel();
+                _reconnectCts?.Dispose();
+            }
+            catch { }
+            _reconnectCts = null;
+            Interlocked.Exchange(ref _reconnectRunning, 0);
+        }
+
+        private async Task<bool> TryConnectOnceAsync(CancellationToken token)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(_serverIp) || _serverPort <= 0)
+                    return false;
+                if (string.IsNullOrEmpty(_username) || string.IsNullOrEmpty(_clientId))
+                    return false;
+
+                var tcp = new TcpClient();
+
+                // Connect with cancellation via Task.WhenAny
+                var connectTask = tcp.ConnectAsync(_serverIp, _serverPort);
+                var done = await Task.WhenAny(connectTask, Task.Delay(8000, token));
+                if (done != connectTask)
+                {
+                    try { tcp.Close(); } catch { }
+                    return false;
+                }
+
+                // propagate connect exceptions
+                await connectTask;
+
+                var ns = tcp.GetStream();
+
+                _tcp = tcp;
+                _ns = ns;
+
+                _connected = true;
+                SetUiConnected(true);
+
+                // Register
+                SendPacket(new RegisterPacket
+                {
+                    ClientId = _clientId,
+                    User = _username!,
+                    PublicKey = _pubXml
+                });
+
+                // start receive loop
+                _recvThread = new Thread(ReceiveLoop) { IsBackground = true };
+                _recvThread.Start();
+
+                _resendTimer.Start();
+
+                UI(() => rtbChat.AppendText("[Connected]\n"));
+                return true;
+            }
+            catch (Exception ex)
+            {
+                UI(() => rtbChat.AppendText("[Reconnect attempt failed] " + ex.Message + "\n"));
+                return false;
+            }
         }
 
         // ================= RECEIVE LOOP =================
@@ -288,8 +425,12 @@ namespace ChatClient
             {
                 if (!_closing)
                 {
-                    InternalDisconnect("socket closed");
+                    InternalDisconnect("socket closed", sendLogout: false);
                     UI(() => rtbChat.AppendText("[Disconnected: socket closed]\n"));
+
+                    // auto reconnect unless user manually disconnected
+                    if (!_manualDisconnect)
+                        StartReconnectLoop("socket closed");
                 }
             }
         }
@@ -722,7 +863,9 @@ namespace ChatClient
         private void RemoteClientForm_FormClosing(object? sender, FormClosingEventArgs e)
         {
             _closing = true;
-            InternalDisconnect("closing");
+            _manualDisconnect = true;
+            StopReconnectLoop();
+            InternalDisconnect("closing", sendLogout: true);
         }
 
         class ChatLogEntry
