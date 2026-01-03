@@ -14,6 +14,8 @@ namespace ChatServer
         private bool _running;
 
         private readonly ConcurrentDictionary<string, ClientConnection> _clients = new();
+
+        // idempotent store: use for chat routing + seen receipt to avoid duplicates
         private readonly ConcurrentDictionary<string, byte> _seenMessages = new();
 
         private readonly ConcurrentDictionary<string, string> _pubKeys = new();
@@ -94,6 +96,14 @@ namespace ChatServer
                 c.SendPacket(pkt);
         }
 
+        // ✅ helper: send packet by clientId (fix SendPacketToClient missing)
+        private void SendPacketToClient<T>(string clientId, T pkt)
+        {
+            if (string.IsNullOrEmpty(clientId)) return;
+            if (_clients.TryGetValue(clientId, out var c))
+                c.SendPacket(pkt);
+        }
+
         public void Route(string json, ClientConnection senderConn)
         {
             PacketBase? basePkt;
@@ -130,7 +140,39 @@ namespace ChatServer
                 case PacketType.DeliveryReceipt:
                     RouteDeliveryReceipt(json);
                     break;
+
+                case PacketType.SeenReceipt:
+                    RouteSeenReceipt(json);
+                    break;
             }
+        }
+
+        private void RouteSeenReceipt(string json)
+        {
+            SeenReceiptPacket? pkt;
+            try { pkt = JsonSerializer.Deserialize<SeenReceiptPacket>(json); }
+            catch { return; }
+            if (pkt == null) return;
+
+            if (string.IsNullOrEmpty(pkt.MessageId) ||
+                string.IsNullOrEmpty(pkt.FromId) || // viewer
+                string.IsNullOrEmpty(pkt.ToId))     // sender
+                return;
+
+            // ✅ idempotent: viewer->sender->messageId (avoid spam)
+            var seenKey = $"seen:{pkt.FromId}:{pkt.ToId}:{pkt.MessageId}";
+            if (!_seenMessages.TryAdd(seenKey, 1))
+                return;
+
+            // ✅ Notify original sender that message was seen
+            // pkt.ToId = original sender
+            SendPacketToClient(pkt.ToId, new ChatAckPacket
+            {
+                MessageId = pkt.MessageId,
+                FromId = pkt.ToId,   // (optional) sender
+                ToId = pkt.FromId,   // (optional) viewer
+                Status = "seen"
+            });
         }
 
         private void RouteRegister(string json, ClientConnection conn)
@@ -161,10 +203,12 @@ namespace ChatServer
                 string.IsNullOrEmpty(pkt.ToId))
                 return;
 
+            // idempotent for routing chat
             var seenKey = $"{pkt.FromId}:{pkt.ToId}:{pkt.MessageId}";
             if (!_seenMessages.TryAdd(seenKey, 1))
                 return;
 
+            // accepted
             if (_clients.TryGetValue(pkt.FromId, out var sender0))
             {
                 sender0.SendPacket(new ChatAckPacket
@@ -180,6 +224,7 @@ namespace ChatServer
             {
                 target.SendRaw(json);
 
+                // delivered (sent to socket)
                 if (_clients.TryGetValue(pkt.FromId, out var sender1))
                 {
                     sender1.SendPacket(new ChatAckPacket
@@ -195,6 +240,7 @@ namespace ChatServer
             {
                 StoreOffline(pkt.ToId, json);
 
+                // offline_saved
                 if (_clients.TryGetValue(pkt.FromId, out var sender2))
                 {
                     sender2.SendPacket(new ChatAckPacket
@@ -224,8 +270,10 @@ namespace ChatServer
             if (pkt.Status != "received")
                 return;
 
+            // remove offline message once receiver confirmed received
             RemoveOfflineMessage(pkt.FromId, pkt.MessageId);
 
+            // delivered_to_client (receiver app got it)
             if (_clients.TryGetValue(pkt.ToId, out var sender))
             {
                 sender.SendPacket(new ChatAckPacket
@@ -237,6 +285,7 @@ namespace ChatServer
                 });
             }
 
+            // allow resend key cleanup (your old logic)
             var idemKey = $"{pkt.ToId}:{pkt.FromId}:{pkt.MessageId}";
             _seenMessages.TryRemove(idemKey, out _);
         }

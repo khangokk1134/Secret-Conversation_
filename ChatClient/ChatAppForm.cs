@@ -49,6 +49,9 @@ namespace ChatClient
         private readonly Dictionary<string, PendingMsg> _pending = new();
         private readonly object _pendingLock = new();
 
+        // ✅ for Seen: remember latest incoming msgId per peer
+        private readonly Dictionary<string, string> _lastIncomingMsgId = new();
+
         private System.Windows.Forms.Timer _resendTimer = null!;
         private System.Windows.Forms.Timer _typingDebounce = null!;
 
@@ -105,10 +108,10 @@ namespace ChatClient
                 InternalDisconnect("closing");
             };
 
-            // IMPORTANT: hook resize ONCE (đừng hook trong AddBubble)
+            // IMPORTANT: hook resize ONCE
             chatFlow.Resize += (_, __) => ReflowBubbles();
 
-            // ✅ FIX: luôn căn lại Online dưới Chat title (DPI/Resize/Text change)
+            // keep Online under title
             Shown += (_, __) => FixChatHeaderLayout();
             Resize += (_, __) => FixChatHeaderLayout();
             lblChatTitle.SizeChanged += (_, __) => FixChatHeaderLayout();
@@ -126,25 +129,20 @@ namespace ChatClient
             FixChatHeaderLayout();
         }
 
-        // ================= FIX: CHAT HEADER LAYOUT (ONLINE NOT OVERLAP) =================
+        // ================= FIX: CHAT HEADER LAYOUT =================
         private void FixChatHeaderLayout()
         {
-            // Chỉ can thiệp vị trí label, không đụng Designer
             if (IsDisposed) return;
             if (lblChatTitle == null || lblChatSub == null) return;
 
             UI(() =>
             {
-                // đảm bảo autosize để lấy đúng kích thước
                 lblChatTitle.AutoSize = true;
                 lblChatSub.AutoSize = true;
 
-                // đặt Online xuống dưới Chat title, cách 2px
                 lblChatSub.Left = lblChatTitle.Left;
                 lblChatSub.Top = lblChatTitle.Bottom + 2;
 
-                // nếu title quá dài, wrap vẫn ok vì autosize,
-                // nhưng nếu muốn chắc hơn thì giới hạn width theo vùng chứa
                 if (lblChatTitle.Parent != null)
                 {
                     int maxW = Math.Max(200, lblChatTitle.Parent.ClientSize.Width - lblChatTitle.Left - 10);
@@ -158,7 +156,6 @@ namespace ChatClient
         private void HookUI()
         {
             btnConnect.Click += (_, __) => ToggleConnect();
-
             btnSend.Click += async (_, __) => await SendMessageAsync();
 
             txtMessage.KeyDown += async (s, e) =>
@@ -180,6 +177,7 @@ namespace ChatClient
                 _typingDebounce.Start();
             };
 
+            // ✅ Seen will happen in OpenConversation only (when user clicks a convo)
             lvConvos.SelectedIndexChanged += (_, __) =>
             {
                 if (_updatingConvoList) return;
@@ -187,7 +185,6 @@ namespace ChatClient
 
                 var it = lvConvos.SelectedItems[0];
                 if (it.Tag is not ConvoState c) return;
-
                 if (c.PeerId == _clientId) return;
 
                 OpenConversation(c.PeerId, c.Name);
@@ -206,7 +203,7 @@ namespace ChatClient
             };
         }
 
-        // ================= FIX COLUMNS (NO STACK OVERFLOW) =================
+        // ================= FIX COLUMNS =================
         private void FixConvoColumns()
         {
             if (_fixingColumns) return;
@@ -218,8 +215,8 @@ namespace ChatClient
                 int w = lvConvos.ClientSize.Width;
                 if (w <= 10) return;
 
-                int unreadW = 95;  // tăng lên để đủ chữ "Unread"
-                int lastW = 100;   // tăng lên để đủ chữ "Last" + nội dung
+                int unreadW = 95;
+                int lastW = 100;
                 int nameW = Math.Max(120, w - unreadW - lastW - 8);
 
                 colUnread.Width = unreadW;
@@ -324,7 +321,6 @@ namespace ChatClient
                 SetUiConnected(true);
                 SetStatus("Connected.", muted: false);
 
-                // clear UI
                 UI(() =>
                 {
                     chatFlow.Controls.Clear();
@@ -334,6 +330,7 @@ namespace ChatClient
                 });
                 _convos.Clear();
                 _userNames.Clear();
+                _lastIncomingMsgId.Clear();
 
                 FixChatHeaderLayout();
 
@@ -368,6 +365,7 @@ namespace ChatClient
 
             _convos.Clear();
             _userNames.Clear();
+            _lastIncomingMsgId.Clear();
 
             lblChatTitle.Text = "Chat";
             lblChatSub.Text = "";
@@ -449,10 +447,8 @@ namespace ChatClient
                             HandleDeliveryReceipt(JsonSerializer.Deserialize<DeliveryReceiptPacket>(json)!);
                             break;
                         case PacketType.Typing:
-                            // optional
                             break;
                         case PacketType.Recall:
-                            // optional
                             break;
                     }
                 }
@@ -644,6 +640,7 @@ namespace ChatClient
                 catch { verified = false; }
             }
 
+            // Receiver -> sender "Delivered" via server
             SendReceipt(pkt);
 
             var fromName = pkt.FromUser;
@@ -675,8 +672,17 @@ namespace ChatClient
                 Status = verified ? "" : "UNVERIFIED"
             });
 
+            // ✅ store latest incoming id for seen
+            _lastIncomingMsgId[pkt.FromId] = pkt.MessageId!;
+
             if (_activePeerId == pkt.FromId)
+            {
                 AddBubble(isMine: false, who: c.Name, text: plain, ts: DateTime.Now, status: verified ? "" : "UNVERIFIED");
+
+                // ✅ because user is already inside this convo, we can mark seen immediately
+                // (they already "opened" the chat)
+                SendSeenIfAny(pkt.FromId);
+            }
         }
 
         private void SendReceipt(ChatPacket pkt)
@@ -693,6 +699,28 @@ namespace ChatClient
                     Status = "received",
                     Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
                 });
+            }
+            catch { }
+        }
+
+        // ✅ Seen is sent when user opens the conversation (clicks it)
+        private void SendSeenIfAny(string peerId)
+        {
+            try
+            {
+                if (!IsReallyConnected()) return;
+                if (string.IsNullOrEmpty(peerId)) return;
+
+                if (_lastIncomingMsgId.TryGetValue(peerId, out var mid) && !string.IsNullOrEmpty(mid))
+                {
+                    SendPacket(new SeenReceiptPacket
+                    {
+                        MessageId = mid,
+                        FromId = _clientId, // viewer
+                        ToId = peerId,      // sender
+                        Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+                    });
+                }
             }
             catch { }
         }
@@ -895,7 +923,6 @@ namespace ChatClient
                 else
                     lblChatSub.Text = "";
 
-                // ✅ FIX ngay lúc đổi text
                 FixChatHeaderLayout();
             });
 
@@ -907,6 +934,9 @@ namespace ChatClient
 
             LoadHistory(peerId);
             ScrollToBottom();
+
+            // ✅ THIS is the "user clicked the chat" moment => send Seen
+            SendSeenIfAny(peerId);
         }
 
         // ================= HISTORY =================
@@ -965,7 +995,7 @@ namespace ChatClient
                     bool mine = e.Dir == "out";
 
                     string who = mine ? "Me" : e.PeerUser;
-                    string status = mine ? "✓" : "";
+                    string status = mine ? "Sent" : "";
                     if (!string.IsNullOrEmpty(e.Status) && !mine)
                         status = e.Status;
 
@@ -996,7 +1026,7 @@ namespace ChatClient
                 AutoSizeMode = AutoSizeMode.GrowAndShrink;
                 Dock = DockStyle.Top;
                 BackColor = Color.Transparent;
-                Padding = new Padding(0, 2, 0, 2); // sát hơn
+                Padding = new Padding(0, 2, 0, 2);
 
                 _bubble = new Panel
                 {
@@ -1129,18 +1159,65 @@ namespace ChatClient
             }
         }
 
+        // ✅ Mark "Seen" for all my messages up to messageId
+        private void MarkSeenUpTo(string messageId)
+        {
+            int idx = -1;
+            for (int i = 0; i < chatFlow.Controls.Count; i++)
+            {
+                if (chatFlow.Controls[i] is BubbleRow br && br.IsMine && br.MessageId == messageId)
+                {
+                    idx = i;
+                    break;
+                }
+            }
+
+            if (idx < 0)
+            {
+                // fallback: mark last mine bubble
+                for (int i = chatFlow.Controls.Count - 1; i >= 0; i--)
+                {
+                    if (chatFlow.Controls[i] is BubbleRow br && br.IsMine)
+                    {
+                        br.SetStatus("Seen");
+                        br.Reposition();
+                        break;
+                    }
+                }
+                return;
+            }
+
+            for (int i = 0; i <= idx; i++)
+            {
+                if (chatFlow.Controls[i] is BubbleRow br && br.IsMine)
+                {
+                    br.SetStatus("Seen");
+                    br.Reposition();
+                }
+            }
+        }
+
         private void UpdateLastMineBubbleStatus(string messageId, string stage)
         {
-            // Bạn muốn chỉ 1 dấu ✓ khi người kia đã nhận
+            // Required behavior:
+            // - offline_saved => Sent (receiver offline)
+            // - delivered_to_client => Delivered (receiver device received)
+            // - seen => Seen (receiver opened chat)
             string s = stage switch
             {
-                "offline_saved" => "⌛", // vẫn giữ đồng hồ nếu lưu offline
-                "timeout" => "!",       // nếu bạn có stage timeout thì hiện !
-                "accepted" => "✓",
-                "delivered" => "✓",
-                "delivered_to_client" => "✓",
+                "offline_saved" => "Sent",
+                "accepted" => "Sent",
+                "delivered" => "Delivered",
+                "delivered_to_client" => "Delivered",
+                "timeout" => "Failed",
                 _ => "…"
             };
+
+            if (stage == "seen")
+            {
+                MarkSeenUpTo(messageId);
+                return;
+            }
 
             for (int i = chatFlow.Controls.Count - 1; i >= 0; i--)
             {
@@ -1151,13 +1228,7 @@ namespace ChatClient
                     break;
                 }
             }
-
-            // Nếu muốn status line vẫn hiện khi delivered_to_client thì giữ,
-            // còn không thì bạn có thể xóa đoạn dưới.
-            if (stage == "delivered_to_client")
-                SetStatus("Delivered to client.", muted: false);
         }
-
 
         private void ScrollToBottom()
         {
@@ -1183,7 +1254,6 @@ namespace ChatClient
 
         private void Header_Resize(object? sender, EventArgs e)
         {
-            // giữ status label luôn rộng, không bị cắt
             lblStatus.Width = Math.Max(200, header.ClientSize.Width - lblStatus.Left - 10);
         }
 

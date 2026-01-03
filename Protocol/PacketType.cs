@@ -11,6 +11,7 @@
         UserList,
         Logout,
         ChatAck,
-        DeliveryReceipt
+        DeliveryReceipt,
+        SeenReceipt = 50
     }
 }
