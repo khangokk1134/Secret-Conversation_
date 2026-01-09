@@ -15,6 +15,9 @@ namespace ChatServer
         private readonly object _writeLock = new();
         private volatile bool _closed = false;
 
+        // ✅ ensure Unregister is called once
+        private volatile bool _unregistered = false;
+
         public string? ClientId { get; private set; }
         public string? Username { get; private set; }
         public string? PublicKey { get; private set; }
@@ -46,12 +49,7 @@ namespace ChatServer
             }
             finally
             {
-                if (!_closed && ClientId != null)
-                {
-                    try { _server.Unregister(ClientId); } catch { }
-                }
-
-                Close();
+                Close(); // ✅ Close() will Unregister safely
             }
         }
 
@@ -101,6 +99,17 @@ namespace ChatServer
         {
             if (_closed) return;
             _closed = true;
+
+            // ✅ always unregister once
+            try
+            {
+                if (!_unregistered && !string.IsNullOrEmpty(ClientId))
+                {
+                    _unregistered = true;
+                    _server.Unregister(ClientId!);
+                }
+            }
+            catch { }
 
             try { _ns.Close(); } catch { }
             try { _tcp.Close(); } catch { }

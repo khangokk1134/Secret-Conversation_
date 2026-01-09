@@ -31,11 +31,11 @@ namespace ChatClient
         private readonly Dictionary<string, TaskCompletionSource<string>> _pubWaiters = new();
         private readonly object _pubLock = new();
 
-        // incoming idempotent
+        // incoming idempotent (runtime)
         private readonly HashSet<string> _seenIncoming = new();
         private readonly object _seenLock = new();
 
-        // pending resend + stage
+        // pending resend + stage (1-1 only)
         private sealed class PendingMsg
         {
             public ChatPacket Packet = new ChatPacket();
@@ -49,19 +49,38 @@ namespace ChatClient
         private readonly Dictionary<string, PendingMsg> _pending = new();
         private readonly object _pendingLock = new();
 
-        // ✅ for Seen: remember latest incoming msgId per peer
+        // ✅ for Seen: remember latest incoming msgId per peer (1-1 only)
         private readonly Dictionary<string, string> _lastIncomingMsgId = new();
+
+        // ✅ prevent spamming seen for same peer+msgId
+        private readonly Dictionary<string, string> _lastSeenSent = new();
 
         private System.Windows.Forms.Timer _resendTimer = null!;
         private System.Windows.Forms.Timer _typingDebounce = null!;
 
+        // Active convo key:
+        // - user: clientId
+        // - room: "room:<roomId>"
         private string? _activePeerId;
         private string? _activePeerName;
+
+        // ================= GROUP =====
+        private sealed class RoomState
+        {
+            public string RoomId = "";
+            public string RoomName = "";
+            public string[] Members = Array.Empty<string>();
+        }
+        private readonly Dictionary<string, RoomState> _rooms = new();
+
+        private bool IsRoomKey(string? key) => !string.IsNullOrEmpty(key) && key.StartsWith("room:", StringComparison.Ordinal);
+        private string RoomIdFromKey(string key) => key.Substring("room:".Length);
+        private string MakeRoomKey(string roomId) => "room:" + roomId;
 
         // ================= DATA MODEL (CONVOS) =================
         private sealed class ConvoState
         {
-            public string PeerId = "";
+            public string PeerId = ""; // can be clientId or room:<id>
             public string Name = "";
             public string Last = "";
             public int Unread = 0;
@@ -72,11 +91,18 @@ namespace ChatClient
         private readonly Dictionary<string, ConvoState> _convos = new();  // peerId -> state
         private readonly Dictionary<string, string> _userNames = new();   // clientId -> username
 
-        // column resize guard (FIX stackoverflow)
+        // column resize guard
         private bool _fixingColumns = false;
 
         // when we update list programmatically, prevent selection recursion
         private bool _updatingConvoList = false;
+
+        // ================= PIN / DELETE / LEAVE =================
+        private readonly HashSet<string> _pinned = new HashSet<string>(StringComparer.Ordinal);
+
+        // ✅ Context menu instance (Designer có thể có sẵn, nhưng tạo ở code để chắc)
+        private ContextMenuStrip _convoMenu = null!;
+        private ToolStripMenuItem _miDeleteConvo = null!;
 
         public ChatAppForm()
         {
@@ -89,6 +115,7 @@ namespace ChatClient
 
             LoadKeys();
             HookUI();
+            InitConvoContextMenu();
 
             _resendTimer = new System.Windows.Forms.Timer();
             _resendTimer.Interval = 1000;
@@ -122,11 +149,15 @@ namespace ChatClient
 
             FixConvoColumns();
             FixChatHeaderLayout();
+
+            // ✅ position "+ Group" button if exists
+            try { PositionCreateGroupButton(); } catch { }
         }
 
         private void ChatAppForm_Load(object sender, EventArgs e)
         {
             FixChatHeaderLayout();
+            try { PositionCreateGroupButton(); } catch { }
         }
 
         // ================= FIX: CHAT HEADER LAYOUT =================
@@ -158,6 +189,16 @@ namespace ChatClient
             btnConnect.Click += (_, __) => ToggleConnect();
             btnSend.Click += async (_, __) => await SendMessageAsync();
 
+            // ✅ Create group button (Designer có)
+            if (btnCreateGroup != null)
+            {
+                btnCreateGroup.Click += (_, __) => CreateGroupUi();
+            }
+            if (leftPanel != null)
+            {
+                leftPanel.Resize += (_, __) => PositionCreateGroupButton();
+            }
+
             txtMessage.KeyDown += async (s, e) =>
             {
                 if (e.KeyCode == Keys.Enter && !e.Shift)
@@ -172,12 +213,13 @@ namespace ChatClient
                 if (!IsReallyConnected()) return;
                 if (string.IsNullOrEmpty(_activePeerId)) return;
                 if (_activePeerId == _clientId) return;
+                if (IsRoomKey(_activePeerId)) return; // typing not implemented for rooms
 
                 _typingDebounce.Stop();
                 _typingDebounce.Start();
             };
 
-            // ✅ Seen will happen in OpenConversation only (when user clicks a convo)
+            // Seen will happen in OpenConversation only (when user clicks a convo)
             lvConvos.SelectedIndexChanged += (_, __) =>
             {
                 if (_updatingConvoList) return;
@@ -201,6 +243,133 @@ namespace ChatClient
                 if (!_fixingColumns)
                     BeginInvoke(new Action(FixConvoColumns));
             };
+        }
+
+        // ✅ Context menu for conversation list
+        private void InitConvoContextMenu()
+        {
+            // IMPORTANT:
+            // - Designer đã có thể tạo miPin/miUnpin/miLeaveGroup (field),
+            //   nên ở đây chỉ dùng lại nếu có; nếu không có thì tạo mới an toàn.
+
+            _convoMenu = new ContextMenuStrip();
+            _convoMenu.Opening += ConvoMenu_Opening;
+
+            // miPin / miUnpin / miLeaveGroup có thể tồn tại từ Designer
+            // => dùng trực tiếp, KHÔNG khai báo lại (tránh CS0102/CS0229)
+            if (miPin == null) miPin = new ToolStripMenuItem("Pin");
+            if (miUnpin == null) miUnpin = new ToolStripMenuItem("Unpin");
+            if (miLeaveGroup == null) miLeaveGroup = new ToolStripMenuItem("Leave group");
+
+            miPin.Click += MiPin_Click;
+            miUnpin.Click += MiUnpin_Click;
+            miLeaveGroup.Click += MiLeaveGroup_Click;
+
+            _miDeleteConvo = new ToolStripMenuItem("Delete (local)");
+            _miDeleteConvo.Click += MiDeleteConvo_Click;
+
+            _convoMenu.Items.Add(miPin);
+            _convoMenu.Items.Add(miUnpin);
+            _convoMenu.Items.Add(new ToolStripSeparator());
+            _convoMenu.Items.Add(_miDeleteConvo);
+            _convoMenu.Items.Add(miLeaveGroup);
+
+            lvConvos.ContextMenuStrip = _convoMenu;
+        }
+
+        // ✅ keep "+ Group" at top-right under Conversations title line
+        private void PositionCreateGroupButton()
+        {
+            if (btnCreateGroup == null || leftPanel == null) return;
+
+            btnCreateGroup.Top = 0;
+            btnCreateGroup.Left = Math.Max(0, leftPanel.ClientSize.Width - btnCreateGroup.Width - 6);
+        }
+
+        // ✅ Create group UI by selecting members
+        private void CreateGroupUi()
+        {
+            if (!IsReallyConnected())
+            {
+                SetStatus("Not connected.", muted: true);
+                return;
+            }
+
+            var items = new List<CreateGroupForm.UserItem>();
+
+            foreach (var kv in _convos.Values)
+            {
+                if (string.IsNullOrWhiteSpace(kv.PeerId)) continue;
+                if (kv.PeerId == _clientId) continue;
+                if (IsRoomKey(kv.PeerId)) continue;
+
+                items.Add(new CreateGroupForm.UserItem
+                {
+                    ClientId = kv.PeerId,
+                    Name = string.IsNullOrWhiteSpace(kv.Name) ? kv.PeerId : kv.Name,
+                    Online = kv.Online
+                });
+            }
+
+            foreach (var kv in _userNames)
+            {
+                var id = kv.Key;
+                if (id == _clientId) continue;
+                if (items.Any(x => x.ClientId == id)) continue;
+
+                items.Add(new CreateGroupForm.UserItem
+                {
+                    ClientId = id,
+                    Name = string.IsNullOrWhiteSpace(kv.Value) ? id : kv.Value,
+                    Online = _convos.TryGetValue(id, out var cc) && cc.Online
+                });
+            }
+
+            if (items.Count == 0)
+            {
+                SetStatus("No other users to add.", muted: true);
+                return;
+            }
+
+            using var dlg = new CreateGroupForm(items);
+            if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+            var roomName = dlg.RoomName;
+            if (string.IsNullOrWhiteSpace(roomName))
+            {
+                SetStatus("Group name is required.", muted: true);
+                return;
+            }
+
+            var picked = dlg.SelectedClientIds;
+            if (picked.Count < 2)
+            {
+                SetStatus("Pick at least 2 members (besides you).", muted: true);
+                return;
+            }
+
+            var roomId = Guid.NewGuid().ToString();
+
+            var memberIds = new List<string> { _clientId };
+            memberIds.AddRange(picked);
+            memberIds = memberIds.Where(x => !string.IsNullOrWhiteSpace(x)).Distinct().ToList();
+
+            try
+            {
+                SendPacket(new CreateRoomPacket
+                {
+                    RoomId = roomId,
+                    RoomName = roomName,
+                    CreatorId = _clientId,
+                    MemberIds = memberIds.ToArray()
+                });
+
+                SetStatus($"Creating group: {roomName}", muted: false);
+            }
+            catch (Exception ex)
+            {
+                SetStatus("Create group failed: " + ex.Message, muted: true);
+            }
         }
 
         // ================= FIX COLUMNS =================
@@ -251,13 +420,16 @@ namespace ChatClient
 
                 btnSend.Enabled = connected;
                 txtMessage.Enabled = connected;
+
+                if (btnCreateGroup != null) btnCreateGroup.Enabled = connected;
             });
         }
 
         // ================= KEYS + CLIENTID =================
         private void LoadKeys()
         {
-            Directory.CreateDirectory("keys");
+            var keyRoot = Path.Combine(DataRoot(), "keys");
+            Directory.CreateDirectory(keyRoot);
             var pubPath = Path.Combine("keys", "my_pub.xml");
             var privPath = Path.Combine("keys", "my_priv.xml");
 
@@ -309,6 +481,11 @@ namespace ChatClient
 
             _clientId = LoadOrCreateClientId(_username);
 
+            // show old conversations even before server userlist arrives
+            LoadPinned();
+            LoadConvosFromHistory();
+            RefreshConvoList();
+
             try
             {
                 _closing = false;
@@ -324,13 +501,16 @@ namespace ChatClient
                 UI(() =>
                 {
                     chatFlow.Controls.Clear();
-                    lvConvos.Items.Clear();
                     lblChatTitle.Text = "Chat";
                     lblChatSub.Text = "";
                 });
-                _convos.Clear();
+
+                _rooms.Clear();
                 _userNames.Clear();
                 _lastIncomingMsgId.Clear();
+                _lastSeenSent.Clear();
+
+                lock (_pendingLock) { _pending.Clear(); }
 
                 FixChatHeaderLayout();
 
@@ -364,8 +544,11 @@ namespace ChatClient
             });
 
             _convos.Clear();
+            LoadPinned();
+            _rooms.Clear();
             _userNames.Clear();
             _lastIncomingMsgId.Clear();
+            _lastSeenSent.Clear();
 
             lblChatTitle.Text = "Chat";
             lblChatSub.Text = "";
@@ -434,20 +617,44 @@ namespace ChatClient
                         case PacketType.UserList:
                             HandleUserList(JsonSerializer.Deserialize<UserListPacket>(json)!);
                             break;
+
                         case PacketType.PublicKey:
                             HandlePubKey(JsonSerializer.Deserialize<PublicKeyPacket>(json)!);
                             break;
+
                         case PacketType.Chat:
                             HandleChat(JsonSerializer.Deserialize<ChatPacket>(json)!);
                             break;
+
                         case PacketType.ChatAck:
                             HandleChatAck(JsonSerializer.Deserialize<ChatAckPacket>(json)!);
                             break;
+
                         case PacketType.DeliveryReceipt:
                             HandleDeliveryReceipt(JsonSerializer.Deserialize<DeliveryReceiptPacket>(json)!);
                             break;
+
+                        // ===== GROUP =====
+                        case PacketType.RoomInfo:
+                            HandleRoomInfo(JsonSerializer.Deserialize<RoomInfoPacket>(json)!);
+                            break;
+
+                        case PacketType.RoomChat:
+                            HandleRoomChat(JsonSerializer.Deserialize<RoomChatPacket>(json)!);
+                            break;
+
+                        case PacketType.RoomAck:
+                            HandleRoomAck(JsonSerializer.Deserialize<RoomAckPacket>(json)!);
+                            break;
+
+                        // ✅ NEW: remove room from client list (when user leaves)
+                        case PacketType.RoomInfoRemoved:
+                            HandleRoomInfoRemoved(JsonSerializer.Deserialize<RoomInfoRemovedPacket>(json)!);
+                            break;
+
                         case PacketType.Typing:
                             break;
+
                         case PacketType.Recall:
                             break;
                     }
@@ -494,10 +701,14 @@ namespace ChatClient
             }
 
             RefreshConvoList();
+
             UI(() =>
             {
-                if (!string.IsNullOrEmpty(_activePeerId) && _convos.TryGetValue(_activePeerId, out var cur))
-                    lblChatSub.Text = cur.Online ? "Online" : "Offline";
+                if (!string.IsNullOrEmpty(_activePeerId))
+                {
+                    if (_convos.TryGetValue(_activePeerId, out var cur))
+                        lblChatSub.Text = IsRoomKey(_activePeerId) ? "" : (cur.Online ? "Online" : "Offline");
+                }
             });
 
             FixChatHeaderLayout();
@@ -520,10 +731,19 @@ namespace ChatClient
                     lvConvos.Items.Clear();
 
                     foreach (var c in _convos.Values
-                        .OrderByDescending(x => x.LastTs)
+                        .OrderByDescending(x => IsPinnedPeer(x.PeerId))
+                        .ThenByDescending(x => x.LastTs)
                         .ThenBy(x => x.Name, StringComparer.CurrentCultureIgnoreCase))
                     {
-                        var name = c.Name + (c.Online ? "" : " (offline)");
+                        string name;
+                        if (IsRoomKey(c.PeerId))
+                        {
+                            name = c.Name;
+                        }
+                        else
+                        {
+                            name = c.Name + (c.Online ? "" : " (offline)");
+                        }
 
                         var it = new ListViewItem(name);
                         it.SubItems.Add(string.IsNullOrEmpty(c.Last) ? "" : c.Last);
@@ -603,7 +823,7 @@ namespace ChatClient
             }
         }
 
-        // ================= CHAT RECEIVE =================
+        // ================= CHAT RECEIVE (1-1) =================
         private async void HandleChat(ChatPacket pkt)
         {
             if (pkt == null) return;
@@ -627,8 +847,12 @@ namespace ChatClient
                 var aes = Convert.FromBase64String(aesB64);
                 plain = CryptoHelper.AesDecryptFromBase64(pkt.EncMsg, aes);
             }
-            catch
+            catch { return; }
+
+            // prevent duplicates across restarts (offline re-delivery)
+            if (HistoryContainsMessageId(pkt.FromId, pkt.MessageId!))
             {
+                SendReceipt(pkt);
                 return;
             }
 
@@ -640,7 +864,6 @@ namespace ChatClient
                 catch { verified = false; }
             }
 
-            // Receiver -> sender "Delivered" via server
             SendReceipt(pkt);
 
             var fromName = pkt.FromUser;
@@ -672,19 +895,16 @@ namespace ChatClient
                 Status = verified ? "" : "UNVERIFIED"
             });
 
-            // ✅ store latest incoming id for seen
             _lastIncomingMsgId[pkt.FromId] = pkt.MessageId!;
 
             if (_activePeerId == pkt.FromId)
             {
                 AddBubble(isMine: false, who: c.Name, text: plain, ts: DateTime.Now, status: verified ? "" : "UNVERIFIED");
-
-                // ✅ because user is already inside this convo, we can mark seen immediately
-                // (they already "opened" the chat)
                 SendSeenIfAny(pkt.FromId);
             }
         }
 
+        // unify receipt meaning to delivered_to_client
         private void SendReceipt(ChatPacket pkt)
         {
             try
@@ -694,25 +914,31 @@ namespace ChatClient
                 SendPacket(new DeliveryReceiptPacket
                 {
                     MessageId = pkt.MessageId ?? "",
-                    FromId = _clientId,
-                    ToId = pkt.FromId,
-                    Status = "received",
+                    FromId = _clientId,   // receiver
+                    ToId = pkt.FromId,    // sender
+                    Status = "delivered_to_client",
                     Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
                 });
             }
             catch { }
         }
 
-        // ✅ Seen is sent when user opens the conversation (clicks it)
+        // Seen is sent when user opens the conversation (clicks it)
         private void SendSeenIfAny(string peerId)
         {
             try
             {
                 if (!IsReallyConnected()) return;
                 if (string.IsNullOrEmpty(peerId)) return;
+                if (IsRoomKey(peerId)) return;
 
                 if (_lastIncomingMsgId.TryGetValue(peerId, out var mid) && !string.IsNullOrEmpty(mid))
                 {
+                    if (_lastSeenSent.TryGetValue(peerId, out var sent) && sent == mid)
+                        return;
+
+                    _lastSeenSent[peerId] = mid;
+
                     SendPacket(new SeenReceiptPacket
                     {
                         MessageId = mid,
@@ -723,6 +949,207 @@ namespace ChatClient
                 }
             }
             catch { }
+        }
+
+        // ================= GROUP: ROOM INFO =================
+        private void HandleRoomInfo(RoomInfoPacket pkt)
+        {
+            if (pkt == null) return;
+            if (string.IsNullOrEmpty(pkt.RoomId) || string.IsNullOrEmpty(pkt.RoomName)) return;
+
+            _rooms[pkt.RoomId] = new RoomState
+            {
+                RoomId = pkt.RoomId,
+                RoomName = pkt.RoomName,
+                Members = pkt.MemberIds ?? Array.Empty<string>()
+            };
+
+            var key = MakeRoomKey(pkt.RoomId);
+
+            if (!_convos.TryGetValue(key, out var c))
+            {
+                c = new ConvoState
+                {
+                    PeerId = key,
+                    Name = "👥 " + pkt.RoomName,
+                    Online = true
+                };
+                _convos[key] = c;
+            }
+            else
+            {
+                c.Name = "👥 " + pkt.RoomName;
+                c.Online = true;
+            }
+
+            RefreshConvoList();
+        }
+
+        // ✅ NEW: server says remove this room from my list
+        private void HandleRoomInfoRemoved(RoomInfoRemovedPacket pkt)
+        {
+            if (pkt == null || string.IsNullOrEmpty(pkt.RoomId)) return;
+
+            _rooms.Remove(pkt.RoomId);
+
+            var key = MakeRoomKey(pkt.RoomId);
+            _convos.Remove(key);
+
+            if (_activePeerId == key)
+            {
+                _activePeerId = null;
+                _activePeerName = null;
+
+                UI(() =>
+                {
+                    chatFlow.Controls.Clear();
+                    lblChatTitle.Text = "Chat";
+                    lblChatSub.Text = "";
+                    FixChatHeaderLayout();
+                });
+            }
+
+            RefreshConvoList();
+            SetStatus("You left the group.", muted: false);
+        }
+
+        // ================= GROUP: ROOM CHAT (E2E) =================
+        private async void HandleRoomChat(RoomChatPacket pkt)
+        {
+            if (pkt == null) return;
+            if (string.IsNullOrEmpty(pkt.RoomId) ||
+                string.IsNullOrEmpty(pkt.FromId) ||
+                string.IsNullOrEmpty(pkt.MessageId))
+                return;
+
+            // ===== dedup runtime (same run) =====
+            var idem = $"room:{pkt.RoomId}:{pkt.FromId}:{pkt.MessageId}";
+            lock (_seenLock)
+            {
+                if (_seenIncoming.Contains(idem)) return;
+                _seenIncoming.Add(idem);
+            }
+
+            // ===== Build room key for convo/history =====
+            var key = MakeRoomKey(pkt.RoomId);
+
+            // ✅ IMPORTANT:
+            // If message already exists in history (app restart/offline replay),
+            // we MUST still send receipt (so server can remove offline),
+            // but should NOT render/store again.
+            bool alreadyInHistory = HistoryContainsMessageId(key, pkt.MessageId!);
+
+            // ===== decrypt AES key for me =====
+            if (pkt.EncKeys == null ||
+                !pkt.EncKeys.TryGetValue(_clientId, out var encKeyForMe) ||
+                string.IsNullOrEmpty(encKeyForMe))
+            {
+                // If clientId changed (deleted clientid txt), you can't decrypt old offline messages.
+                // Just ignore.
+                return;
+            }
+
+            string plain;
+            try
+            {
+                var aesB64 = CryptoHelper.RsaDecryptBase64(encKeyForMe, _privXml);
+                var aes = Convert.FromBase64String(aesB64);
+                plain = CryptoHelper.AesDecryptFromBase64(pkt.EncMsg, aes);
+            }
+            catch
+            {
+                return;
+            }
+
+            // Resolve sender name (for UI + history)
+            var senderName = !string.IsNullOrWhiteSpace(pkt.FromUser)
+                ? pkt.FromUser
+                : (_userNames.TryGetValue(pkt.FromId, out var nn) && !string.IsNullOrWhiteSpace(nn) ? nn : pkt.FromId);
+
+            // ✅ send room delivery receipt to server (ALWAYS, even if duplicate-history)
+            try
+            {
+                if (IsReallyConnected())
+                {
+                    SendPacket(new RoomDeliveryReceiptPacket
+                    {
+                        RoomId = pkt.RoomId,
+                        MessageId = pkt.MessageId ?? "",
+                        FromId = _clientId,     // receiver = me
+                        ToId = pkt.FromId,      // original sender
+                        Status = "delivered_to_client",
+                        Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+                    });
+                }
+            }
+            catch { }
+
+            // If already stored in history => don't show/store again
+            if (alreadyInHistory)
+                return;
+
+            // ===== verify signature =====
+            bool verified = false;
+            var pub = await EnsurePubKeyAsync(pkt.FromId);
+            if (!string.IsNullOrEmpty(pub))
+            {
+                try { verified = CryptoHelper.VerifySignature(plain, pkt.Sig, pub); }
+                catch { verified = false; }
+            }
+
+            // ===== ensure convo exists =====
+            if (!_convos.TryGetValue(key, out var c))
+            {
+                var rn = _rooms.TryGetValue(pkt.RoomId, out var rs) ? rs.RoomName : pkt.RoomId;
+                c = new ConvoState
+                {
+                    PeerId = key,
+                    Name = "👥 " + rn,
+                    Online = true
+                };
+                _convos[key] = c;
+            }
+
+            c.Last = TrimPreview(plain);
+            c.LastTs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+            if (_activePeerId != key)
+                c.Unread++;
+
+            RefreshConvoList();
+
+            // ✅ FIX: History must store senderName (NOT group name)
+            SaveHistory(new ChatLogEntry
+            {
+                Ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                Dir = "in",
+                PeerId = key,              // room key
+                PeerUser = senderName,     // ✅ sender name
+                Text = plain,
+                MessageId = pkt.MessageId ?? "",
+                Status = verified ? "" : "UNVERIFIED"
+            });
+
+            // ===== render if active room =====
+            if (_activePeerId == key)
+            {
+                AddBubble(
+                    isMine: false,
+                    who: senderName,
+                    text: plain,
+                    ts: DateTime.Now,
+                    status: verified ? "" : "UNVERIFIED"
+                );
+            }
+        }
+
+
+        private void HandleRoomAck(RoomAckPacket pkt)
+        {
+            if (pkt == null) return;
+            if (string.IsNullOrEmpty(pkt.MessageId)) return;
+
+            UI(() => UpdateLastMineBubbleStatus(pkt.MessageId, pkt.Status ?? ""));
         }
 
         // ================= ACK / RECEIPT =================
@@ -738,6 +1165,24 @@ namespace ChatClient
                     p.Stage = pkt.Status ?? p.Stage;
                     if (pkt.Status == "delivered_to_client")
                         _pending.Remove(pkt.MessageId);
+                }
+            }
+
+            if (pkt.Status == "seen")
+            {
+                var peer = pkt.ToId; // viewer id
+                if (!string.IsNullOrEmpty(peer))
+                {
+                    SaveHistory(new ChatLogEntry
+                    {
+                        Ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                        Dir = "sys",
+                        PeerId = peer,
+                        PeerUser = _userNames.TryGetValue(peer, out var nn) ? nn : peer,
+                        Text = "__seen__",
+                        MessageId = pkt.MessageId,
+                        Status = "seen"
+                    });
                 }
             }
 
@@ -773,45 +1218,154 @@ namespace ChatClient
             var plain = txtMessage.Text.Trim();
             if (plain.Length == 0) return;
 
+            // Quick create group: /group RoomName
+            if (plain.StartsWith("/group ", StringComparison.OrdinalIgnoreCase))
+            {
+                var roomName = plain.Substring(7).Trim();
+                if (roomName.Length == 0) roomName = "New Group";
+
+                if (string.IsNullOrEmpty(_activePeerId) || IsRoomKey(_activePeerId) || _activePeerId == _clientId)
+                {
+                    SetStatus("Open a 1-1 chat first, then use /group RoomName", muted: true);
+                    return;
+                }
+
+                var roomId = Guid.NewGuid().ToString();
+
+                SendPacket(new CreateRoomPacket
+                {
+                    RoomId = roomId,
+                    RoomName = roomName,
+                    CreatorId = _clientId,
+                    MemberIds = new[] { _clientId, _activePeerId }
+                });
+
+                txtMessage.Clear();
+                SetStatus($"Creating group: {roomName}", muted: false);
+                return;
+            }
+
             var toId = _activePeerId!;
             var toName = _activePeerName ?? toId;
 
-            var pub = await EnsurePubKeyAsync(toId);
-            if (pub == null)
+            // ===== ROOM CHAT =====
+            if (IsRoomKey(toId))
+            {
+                var roomId = RoomIdFromKey(toId);
+                if (!_rooms.TryGetValue(roomId, out var rs))
+                {
+                    SetStatus("Room info not ready.", muted: true);
+                    return;
+                }
+
+                var members = (rs.Members ?? Array.Empty<string>())
+                    .Where(x => !string.IsNullOrEmpty(x) && x != _clientId)
+                    .Distinct()
+                    .ToList();
+
+                if (members.Count == 0)
+                {
+                    SetStatus("Room has no other members.", muted: true);
+                    return;
+                }
+
+                var msgId = Guid.NewGuid().ToString();
+                var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+                var aes = CryptoHelper.GenerateAesKey();
+                var encMsg = CryptoHelper.AesEncryptToBase64(plain, aes);
+                var aesB64 = Convert.ToBase64String(aes);
+
+                var encKeys = new Dictionary<string, string>();
+                foreach (var mid in members)
+                {
+                    var pub = await EnsurePubKeyAsync(mid);
+                    if (string.IsNullOrEmpty(pub))
+                    {
+                        SetStatus("Cannot get public key for a member: " + mid, muted: true);
+                        return;
+                    }
+                    encKeys[mid] = CryptoHelper.RsaEncryptBase64(aesB64, pub);
+                }
+
+                var sig = CryptoHelper.SignData(plain, _privXml);
+
+                var rpkt = new RoomChatPacket
+                {
+                    RoomId = roomId,
+                    FromId = _clientId,
+                    FromUser = _username ?? "",
+                    EncMsg = encMsg,
+                    EncKeys = encKeys,
+                    Sig = sig,
+                    MessageId = msgId,
+                    Timestamp = nowMs
+                };
+
+                SendPacket(rpkt);
+
+                if (_convos.TryGetValue(toId, out var croom))
+                {
+                    croom.Last = TrimPreview(plain);
+                    croom.LastTs = nowMs;
+                    RefreshConvoList();
+                }
+
+                SaveHistory(new ChatLogEntry
+                {
+                    Ts = nowMs,
+                    Dir = "out",
+                    PeerId = toId,
+                    PeerUser = toName,
+                    Text = plain,
+                    MessageId = msgId,
+                    Status = "sent"
+                });
+
+                AddBubble(isMine: true, who: "Me", text: plain, ts: DateTime.Now, status: "…", messageId: msgId);
+
+                txtMessage.Clear();
+                txtMessage.Focus();
+                return;
+            }
+
+            // ===== 1-1 CHAT =====
+            var pub1 = await EnsurePubKeyAsync(toId);
+            if (pub1 == null)
             {
                 SetStatus("Cannot get receiver public key.", muted: true);
                 return;
             }
 
-            var msgId = Guid.NewGuid().ToString();
-            var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var msgId1 = Guid.NewGuid().ToString();
+            var nowMs1 = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
-            var aes = CryptoHelper.GenerateAesKey();
-            var encMsg = CryptoHelper.AesEncryptToBase64(plain, aes);
-            var encKey = CryptoHelper.RsaEncryptBase64(Convert.ToBase64String(aes), pub);
-            var sig = CryptoHelper.SignData(plain, _privXml);
+            var aes1 = CryptoHelper.GenerateAesKey();
+            var encMsg1 = CryptoHelper.AesEncryptToBase64(plain, aes1);
+            var encKey1 = CryptoHelper.RsaEncryptBase64(Convert.ToBase64String(aes1), pub1);
+            var sig1 = CryptoHelper.SignData(plain, _privXml);
 
             var pkt = new ChatPacket
             {
-                MessageId = msgId,
-                Timestamp = nowMs,
+                MessageId = msgId1,
+                Timestamp = nowMs1,
                 FromId = _clientId,
                 FromUser = _username ?? "",
                 ToId = toId,
                 ToUser = toName,
-                EncKey = encKey,
-                EncMsg = encMsg,
-                Sig = sig
+                EncKey = encKey1,
+                EncMsg = encMsg1,
+                Sig = sig1
             };
 
             lock (_pendingLock)
             {
-                _pending[msgId] = new PendingMsg
+                _pending[msgId1] = new PendingMsg
                 {
                     Packet = pkt,
                     Attempts = 1,
-                    FirstSentMs = nowMs,
-                    LastSentMs = nowMs,
+                    FirstSentMs = nowMs1,
+                    LastSentMs = nowMs1,
                     Stage = "new",
                     PlainPreview = plain
                 };
@@ -822,22 +1376,22 @@ namespace ChatClient
             if (_convos.TryGetValue(toId, out var c))
             {
                 c.Last = TrimPreview(plain);
-                c.LastTs = nowMs;
+                c.LastTs = nowMs1;
                 RefreshConvoList();
             }
 
             SaveHistory(new ChatLogEntry
             {
-                Ts = nowMs,
+                Ts = nowMs1,
                 Dir = "out",
                 PeerId = toId,
                 PeerUser = toName,
                 Text = plain,
-                MessageId = msgId,
+                MessageId = msgId1,
                 Status = "sent"
             });
 
-            AddBubble(isMine: true, who: "Me", text: plain, ts: DateTime.Now, status: "…", messageId: msgId);
+            AddBubble(isMine: true, who: "Me", text: plain, ts: DateTime.Now, status: "…", messageId: msgId1);
 
             txtMessage.Clear();
             txtMessage.Focus();
@@ -889,6 +1443,7 @@ namespace ChatClient
             {
                 if (!IsReallyConnected()) return;
                 if (string.IsNullOrEmpty(_activePeerId)) return;
+                if (IsRoomKey(_activePeerId)) return;
 
                 SendPacket(new TypingPacket
                 {
@@ -917,11 +1472,19 @@ namespace ChatClient
 
             UI(() =>
             {
-                lblChatTitle.Text = $"Chat with {peerName}";
-                if (_convos.TryGetValue(peerId, out var c))
-                    lblChatSub.Text = c.Online ? "Online" : "Offline";
-                else
+                if (IsRoomKey(peerId))
+                {
+                    lblChatTitle.Text = peerName;
                     lblChatSub.Text = "";
+                }
+                else
+                {
+                    lblChatTitle.Text = $"Chat with {peerName}";
+                    if (_convos.TryGetValue(peerId, out var c))
+                        lblChatSub.Text = c.Online ? "Online" : "Offline";
+                    else
+                        lblChatSub.Text = "";
+                }
 
                 FixChatHeaderLayout();
             });
@@ -935,15 +1498,15 @@ namespace ChatClient
             LoadHistory(peerId);
             ScrollToBottom();
 
-            // ✅ THIS is the "user clicked the chat" moment => send Seen
-            SendSeenIfAny(peerId);
+            if (!IsRoomKey(peerId))
+                SendSeenIfAny(peerId);
         }
 
         // ================= HISTORY =================
         private sealed class ChatLogEntry
         {
             public long Ts { get; set; }
-            public string Dir { get; set; } = "";
+            public string Dir { get; set; } = ""; // in/out/sys
             public string PeerId { get; set; } = "";
             public string PeerUser { get; set; } = "";
             public string Text { get; set; } = "";
@@ -953,9 +1516,16 @@ namespace ChatClient
 
         private string GetHistoryFile(string peerId)
         {
-            var root = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "history", _clientId);
+            var root = Path.Combine(DataRoot(), "history", _clientId);
             Directory.CreateDirectory(root);
-            return Path.Combine(root, $"{peerId}.jsonl");
+
+            string safeName;
+            if (IsRoomKey(peerId))
+                safeName = "r_" + RoomIdFromKey(peerId);
+            else
+                safeName = "u_" + peerId;
+
+            return Path.Combine(root, $"{safeName}.jsonl");
         }
 
         private void SaveHistory(ChatLogEntry e)
@@ -982,6 +1552,8 @@ namespace ChatClient
                     return;
                 }
 
+                string lastSeenId = "";
+
                 foreach (var line in File.ReadLines(file))
                 {
                     if (string.IsNullOrWhiteSpace(line)) continue;
@@ -990,6 +1562,12 @@ namespace ChatClient
                     try { e = JsonSerializer.Deserialize<ChatLogEntry>(line); }
                     catch { continue; }
                     if (e == null) continue;
+
+                    if (e.Dir == "sys" && e.Status == "seen" && !string.IsNullOrEmpty(e.MessageId))
+                    {
+                        lastSeenId = e.MessageId;
+                        continue;
+                    }
 
                     var dt = DateTimeOffset.FromUnixTimeMilliseconds(e.Ts).LocalDateTime;
                     bool mine = e.Dir == "out";
@@ -1002,8 +1580,106 @@ namespace ChatClient
                     AddBubble(mine, who, e.Text, dt, status, e.MessageId);
                 }
 
+                if (!string.IsNullOrEmpty(lastSeenId))
+                    MarkSeenUpTo(lastSeenId);
+
                 chatFlow.ResumeLayout();
             });
+        }
+
+        private void LoadConvosFromHistory()
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(_clientId)) return;
+
+                var root = Path.Combine(DataRoot(), "history", _clientId);
+                if (!Directory.Exists(root)) return;
+
+                foreach (var file in Directory.EnumerateFiles(root, "*.jsonl"))
+                {
+                    var name = Path.GetFileNameWithoutExtension(file);
+                    if (string.IsNullOrEmpty(name)) continue;
+
+                    string peerId;
+                    if (name.StartsWith("u_", StringComparison.Ordinal))
+                        peerId = name.Substring(2);
+                    else if (name.StartsWith("r_", StringComparison.Ordinal))
+                        peerId = "room:" + name.Substring(2);
+                    else
+                        continue;
+
+                    long lastTs = 0;
+                    string lastText = "";
+                    string lastPeerUser = "";
+
+                    foreach (var line in File.ReadLines(file))
+                    {
+                        if (string.IsNullOrWhiteSpace(line)) continue;
+                        try
+                        {
+                            var e = JsonSerializer.Deserialize<ChatLogEntry>(line);
+                            if (e == null) continue;
+                            if (e.Dir == "sys") continue;
+
+                            lastTs = e.Ts;
+                            lastText = TrimPreview(e.Text ?? "");
+                            lastPeerUser = e.PeerUser ?? "";
+                        }
+                        catch { }
+                    }
+
+                    if (!_convos.TryGetValue(peerId, out var c))
+                    {
+                        c = new ConvoState { PeerId = peerId };
+                        _convos[peerId] = c;
+                    }
+
+                    if (string.IsNullOrWhiteSpace(c.Name))
+                    {
+                        if (IsRoomKey(peerId))
+                            c.Name = "👥 " + peerId;
+                        else if (_userNames.TryGetValue(peerId, out var nn) && !string.IsNullOrWhiteSpace(nn))
+                            c.Name = nn;
+                        else if (!string.IsNullOrWhiteSpace(lastPeerUser))
+                            c.Name = lastPeerUser;
+                        else
+                            c.Name = peerId;
+                    }
+
+                    c.LastTs = Math.Max(c.LastTs, lastTs);
+                    if (!string.IsNullOrEmpty(lastText))
+                        c.Last = lastText;
+                }
+            }
+            catch { }
+        }
+
+        private bool HistoryContainsMessageId(string peerId, string messageId)
+        {
+            if (string.IsNullOrEmpty(peerId) || string.IsNullOrEmpty(messageId)) return false;
+
+            try
+            {
+                var file = GetHistoryFile(peerId);
+                if (!File.Exists(file)) return false;
+
+                foreach (var line in File.ReadLines(file))
+                {
+                    if (string.IsNullOrWhiteSpace(line)) continue;
+                    if (!line.Contains(messageId, StringComparison.Ordinal)) continue;
+
+                    try
+                    {
+                        var e = JsonSerializer.Deserialize<ChatLogEntry>(line);
+                        if (e != null && e.MessageId == messageId) return true;
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+
+            return false;
         }
 
         // ================= CHAT BUBBLES =================
@@ -1159,7 +1835,6 @@ namespace ChatClient
             }
         }
 
-        // ✅ Mark "Seen" for all my messages up to messageId
         private void MarkSeenUpTo(string messageId)
         {
             int idx = -1;
@@ -1174,7 +1849,6 @@ namespace ChatClient
 
             if (idx < 0)
             {
-                // fallback: mark last mine bubble
                 for (int i = chatFlow.Controls.Count - 1; i >= 0; i--)
                 {
                     if (chatFlow.Controls[i] is BubbleRow br && br.IsMine)
@@ -1199,10 +1873,6 @@ namespace ChatClient
 
         private void UpdateLastMineBubbleStatus(string messageId, string stage)
         {
-            // Required behavior:
-            // - offline_saved => Sent (receiver offline)
-            // - delivered_to_client => Delivered (receiver device received)
-            // - seen => Seen (receiver opened chat)
             string s = stage switch
             {
                 "offline_saved" => "Sent",
@@ -1279,8 +1949,155 @@ namespace ChatClient
             return true;
         }
 
-        private void lvConvos_SelectedIndexChanged(object sender, EventArgs e)
+        // Designer still hooks this; keep it empty
+        private void lvConvos_SelectedIndexChanged(object sender, EventArgs e) { }
+
+        // ================= PIN / DELETE / LEAVE =================
+        private string PinnedFilePath()
         {
+            var root = Path.Combine(DataRoot(), "history", _clientId);
+            Directory.CreateDirectory(root);
+            return Path.Combine(root, "pinned.json");
+        }
+
+        private void LoadPinned()
+        {
+            try
+            {
+                _pinned.Clear();
+                var f = PinnedFilePath();
+                if (!File.Exists(f)) return;
+
+                var arr = JsonSerializer.Deserialize<string[]>(File.ReadAllText(f)) ?? Array.Empty<string>();
+                foreach (var x in arr)
+                    if (!string.IsNullOrWhiteSpace(x)) _pinned.Add(x.Trim());
+            }
+            catch { }
+        }
+
+        private void SavePinned()
+        {
+            try
+            {
+                File.WriteAllText(PinnedFilePath(), JsonSerializer.Serialize(_pinned.ToArray()));
+            }
+            catch { }
+        }
+
+        private bool IsPinnedPeer(string peerId) => !string.IsNullOrEmpty(peerId) && _pinned.Contains(peerId);
+
+        private ConvoState? GetSelectedConvo()
+        {
+            if (lvConvos.SelectedItems.Count == 0) return null;
+            return lvConvos.SelectedItems[0].Tag as ConvoState;
+        }
+
+        private void ConvoMenu_Opening(object? sender, System.ComponentModel.CancelEventArgs e)
+        {
+            var c = GetSelectedConvo();
+            if (c == null)
+            {
+                e.Cancel = true;
+                return;
+            }
+
+            bool isPinned = IsPinnedPeer(c.PeerId);
+            miPin.Visible = !isPinned;
+            miUnpin.Visible = isPinned;
+
+            bool isRoom = IsRoomKey(c.PeerId);
+            miLeaveGroup.Visible = isRoom;
+        }
+
+        private void MiPin_Click(object? sender, EventArgs e)
+        {
+            var c = GetSelectedConvo();
+            if (c == null) return;
+
+            _pinned.Add(c.PeerId);
+            SavePinned();
+            RefreshConvoList();
+        }
+
+        private void MiUnpin_Click(object? sender, EventArgs e)
+        {
+            var c = GetSelectedConvo();
+            if (c == null) return;
+
+            _pinned.Remove(c.PeerId);
+            SavePinned();
+            RefreshConvoList();
+        }
+
+        private void MiDeleteConvo_Click(object? sender, EventArgs e)
+        {
+            var c = GetSelectedConvo();
+            if (c == null) return;
+
+            var peerId = c.PeerId;
+
+            try
+            {
+                var file = GetHistoryFile(peerId);
+                if (File.Exists(file)) File.Delete(file);
+            }
+            catch { }
+
+            _pinned.Remove(peerId);
+            SavePinned();
+
+            _convos.Remove(peerId);
+
+            if (_activePeerId == peerId)
+            {
+                _activePeerId = null;
+                _activePeerName = null;
+
+                UI(() =>
+                {
+                    chatFlow.Controls.Clear();
+                    lblChatTitle.Text = "Chat";
+                    lblChatSub.Text = "";
+                    FixChatHeaderLayout();
+                });
+            }
+
+            RefreshConvoList();
+            SetStatus("Deleted conversation (local).", muted: false);
+        }
+
+        // ✅ Leave group: send LeaveRoomPacket to server
+        private void MiLeaveGroup_Click(object? sender, EventArgs e)
+        {
+            var c = GetSelectedConvo();
+            if (c == null) return;
+            if (!IsRoomKey(c.PeerId)) return;
+
+            var roomId = RoomIdFromKey(c.PeerId);
+
+            try
+            {
+                if (IsReallyConnected())
+                {
+                    SendPacket(new LeaveRoomPacket
+                    {
+                        RoomId = roomId,
+                        ClientId = _clientId
+                    });
+                }
+            }
+            catch { }
+
+            // UI will be removed when RoomInfoRemoved arrives from server
+            SetStatus("Leaving group...", muted: false);
+        }
+        private static string DataRoot()
+        {
+            var root = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "SecureChat");
+            Directory.CreateDirectory(root);
+            return root;
         }
     }
 }

@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 
 namespace Protocol
 {
@@ -9,10 +10,7 @@ namespace Protocol
         public string User { get; set; } = string.Empty;
         public string PublicKey { get; set; } = string.Empty;
 
-        public RegisterPacket()
-        {
-            Type = PacketType.Register;
-        }
+        public RegisterPacket() { Type = PacketType.Register; }
     }
 
     // ================= CHAT =================
@@ -27,14 +25,10 @@ namespace Protocol
         public string EncMsg { get; set; } = string.Empty;
         public string Sig { get; set; } = string.Empty;
 
-        // Sender nên set MessageId khi gửi; JSON deserialize sẽ overwrite giá trị này
         public string MessageId { get; set; } = Guid.NewGuid().ToString();
         public long Timestamp { get; set; } = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
-        public ChatPacket()
-        {
-            Type = PacketType.Chat;
-        }
+        public ChatPacket() { Type = PacketType.Chat; }
     }
 
     // ================= TYPING =================
@@ -45,24 +39,16 @@ namespace Protocol
         public string FromUser { get; set; } = string.Empty;
         public bool IsTyping { get; set; }
 
-        public TypingPacket()
-        {
-            Type = PacketType.Typing;
-        }
+        public TypingPacket() { Type = PacketType.Typing; }
     }
 
     // ================= GET PUBLIC KEY =================
     public class GetPublicKeyPacket : PacketBase
     {
         public string ClientId { get; set; } = string.Empty;
-
-        // optional: người đang yêu cầu key (server có thể không dùng)
         public string FromId { get; set; } = string.Empty;
 
-        public GetPublicKeyPacket()
-        {
-            Type = PacketType.GetPublicKey;
-        }
+        public GetPublicKeyPacket() { Type = PacketType.GetPublicKey; }
     }
 
     // ================= PUBLIC KEY =================
@@ -71,10 +57,7 @@ namespace Protocol
         public string ClientId { get; set; } = string.Empty;
         public string PublicKey { get; set; } = string.Empty;
 
-        public PublicKeyPacket()
-        {
-            Type = PacketType.PublicKey;
-        }
+        public PublicKeyPacket() { Type = PacketType.PublicKey; }
     }
 
     // ================= ACK (SERVER -> SENDER) =================
@@ -83,16 +66,9 @@ namespace Protocol
         public string MessageId { get; set; } = "";
         public string FromId { get; set; } = ""; // sender
         public string ToId { get; set; } = "";   // receiver
-
-        // recommended statuses:
-        // accepted | delivered | offline_saved | delivered_to_client
-        // (timeout is client-side only)
         public string Status { get; set; } = "";
 
-        public ChatAckPacket()
-        {
-            Type = PacketType.ChatAck;
-        }
+        public ChatAckPacket() { Type = PacketType.ChatAck; }
     }
 
     // ================= DELIVERY RECEIPT (RECEIVER -> SERVER) =================
@@ -101,28 +77,17 @@ namespace Protocol
         public string MessageId { get; set; } = "";
         public string FromId { get; set; } = "";   // receiver
         public string ToId { get; set; } = "";     // original sender
-
-        // for now we use: received
-        // (later can extend: delivered/read, but server currently only handles "received")
-        public string Status { get; set; } = "";
-
+        public string Status { get; set; } = "";   // now: delivered_to_client
         public long Timestamp { get; set; }
 
-        public DeliveryReceiptPacket()
-        {
-            Type = PacketType.DeliveryReceipt;
-        }
+        public DeliveryReceiptPacket() { Type = PacketType.DeliveryReceipt; }
     }
 
     // ================= USER LIST =================
     public class UserListPacket : PacketBase
     {
         public UserInfo[] Users { get; set; } = Array.Empty<UserInfo>();
-
-        public UserListPacket()
-        {
-            Type = PacketType.UserList;
-        }
+        public UserListPacket() { Type = PacketType.UserList; }
     }
 
     public class UserInfo
@@ -136,11 +101,7 @@ namespace Protocol
     public class LogoutPacket : PacketBase
     {
         public string ClientId { get; set; } = string.Empty;
-
-        public LogoutPacket()
-        {
-            Type = PacketType.Logout;
-        }
+        public LogoutPacket() { Type = PacketType.Logout; }
     }
 
     // ================= RECALL =================
@@ -150,9 +111,60 @@ namespace Protocol
         public string ToId { get; set; } = string.Empty;
         public string MessageId { get; set; } = string.Empty;
 
-        public RecallPacket()
-        {
-            Type = PacketType.Recall;
-        }
+        public RecallPacket() { Type = PacketType.Recall; }
+    }
+
+    // ================= GROUP: CREATE ROOM =================
+    public class CreateRoomPacket : PacketBase
+    {
+        public string RoomId { get; set; } = "";
+        public string RoomName { get; set; } = "";
+        public string CreatorId { get; set; } = "";
+        public string[] MemberIds { get; set; } = Array.Empty<string>();
+
+        public CreateRoomPacket() { Type = PacketType.CreateRoom; }
+    }
+
+    // ================= GROUP: ROOM INFO =================
+    public class RoomInfoPacket : PacketBase
+    {
+        public string RoomId { get; set; } = "";
+        public string RoomName { get; set; } = "";
+        public string[] MemberIds { get; set; } = Array.Empty<string>();
+
+        public RoomInfoPacket() { Type = PacketType.RoomInfo; }
+    }
+
+    // ================= GROUP: ROOM CHAT (E2E) =================
+    public class RoomChatPacket : PacketBase
+    {
+        public string RoomId { get; set; } = "";
+
+        public string FromId { get; set; } = "";
+        public string FromUser { get; set; } = "";
+
+        // One AES-encrypted payload for everyone:
+        public string EncMsg { get; set; } = "";
+
+        // Per-member RSA-encrypted AES key:
+        public Dictionary<string, string> EncKeys { get; set; } = new();
+
+        public string Sig { get; set; } = "";
+
+        public string MessageId { get; set; } = Guid.NewGuid().ToString();
+        public long Timestamp { get; set; } = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+        public RoomChatPacket() { Type = PacketType.RoomChat; }
+    }
+
+    // ================= GROUP: ROOM ACK =================
+    public class RoomAckPacket : PacketBase
+    {
+        public string RoomId { get; set; } = "";
+        public string MessageId { get; set; } = "";
+        public string FromId { get; set; } = ""; // sender
+        public string Status { get; set; } = ""; // accepted | delivered
+
+        public RoomAckPacket() { Type = PacketType.RoomAck; }
     }
 }

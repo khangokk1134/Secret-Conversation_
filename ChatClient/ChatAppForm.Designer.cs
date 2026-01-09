@@ -46,9 +46,24 @@ namespace ChatClient
         private ListView lvConvos;
         private ColumnHeader colName;
         private ColumnHeader colLast;
+        private ColumnHeader colUnread;
+
+        // ✅ NEW
+        private Button btnCreateGroup;
+
+        // ✅ NEW: context menu
+        private ContextMenuStrip convoMenu;
+        private ToolStripMenuItem miPin;
+        private ToolStripMenuItem miUnpin;
+        private ToolStripSeparator miSep1;
+        private ToolStripMenuItem miLeaveGroup;
+        private ToolStripSeparator miSep2;
+        private ToolStripMenuItem miDeleteConvo;
 
         private void InitializeComponent()
         {
+            components = new System.ComponentModel.Container();
+
             root = new TableLayoutPanel();
             header = new Panel();
             headerTitle = new Label();
@@ -60,6 +75,19 @@ namespace ChatClient
             body = new TableLayoutPanel();
             leftPanel = new Panel();
             lblConvosTitle = new Label();
+
+            // ✅ NEW
+            btnCreateGroup = new Button();
+
+            // ✅ NEW: context menu
+            convoMenu = new ContextMenuStrip(components);
+            miPin = new ToolStripMenuItem();
+            miUnpin = new ToolStripMenuItem();
+            miSep1 = new ToolStripSeparator();
+            miLeaveGroup = new ToolStripMenuItem();
+            miSep2 = new ToolStripSeparator();
+            miDeleteConvo = new ToolStripMenuItem();
+
             lvConvos = new ListView();
             colName = new ColumnHeader();
             colLast = new ColumnHeader();
@@ -73,6 +101,7 @@ namespace ChatClient
             txtMessage = new TextBox();
             chatScrollHost = new Panel();
             chatFlow = new FlowLayoutPanel();
+
             root.SuspendLayout();
             header.SuspendLayout();
             body.SuspendLayout();
@@ -82,6 +111,7 @@ namespace ChatClient
             inputPanel.SuspendLayout();
             chatScrollHost.SuspendLayout();
             SuspendLayout();
+
             // 
             // root
             // 
@@ -98,6 +128,7 @@ namespace ChatClient
             root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
             root.Size = new Size(1100, 700);
             root.TabIndex = 0;
+
             // 
             // header
             // 
@@ -115,6 +146,7 @@ namespace ChatClient
             header.Size = new Size(1094, 50);
             header.TabIndex = 0;
             header.Resize += Header_Resize;
+
             // 
             // headerTitle
             // 
@@ -125,6 +157,7 @@ namespace ChatClient
             headerTitle.Size = new Size(209, 31);
             headerTitle.TabIndex = 0;
             headerTitle.Text = "Secure Chat Client";
+
             // 
             // txtServer
             // 
@@ -133,6 +166,7 @@ namespace ChatClient
             txtServer.Size = new Size(120, 35);
             txtServer.TabIndex = 1;
             txtServer.Text = "127.0.0.1";
+
             // 
             // txtPort
             // 
@@ -141,6 +175,7 @@ namespace ChatClient
             txtPort.Size = new Size(70, 35);
             txtPort.TabIndex = 2;
             txtPort.Text = "5000";
+
             // 
             // txtUser
             // 
@@ -149,6 +184,7 @@ namespace ChatClient
             txtUser.Size = new Size(140, 35);
             txtUser.TabIndex = 3;
             txtUser.Text = "Alice";
+
             // 
             // btnConnect
             // 
@@ -159,6 +195,7 @@ namespace ChatClient
             btnConnect.Size = new Size(154, 47);
             btnConnect.TabIndex = 4;
             btnConnect.Text = "Connect";
+
             // 
             // lblStatus
             // 
@@ -168,6 +205,7 @@ namespace ChatClient
             lblStatus.Size = new Size(332, 28);
             lblStatus.TabIndex = 5;
             lblStatus.TextAlign = ContentAlignment.MiddleLeft;
+
             // 
             // body
             // 
@@ -184,11 +222,13 @@ namespace ChatClient
             body.RowStyles.Add(new RowStyle(SizeType.Absolute, 20F));
             body.Size = new Size(1094, 638);
             body.TabIndex = 1;
+
             // 
             // leftPanel
             // 
             leftPanel.BackColor = Color.White;
             leftPanel.Controls.Add(lblConvosTitle);
+            leftPanel.Controls.Add(btnCreateGroup);
             leftPanel.Controls.Add(lvConvos);
             leftPanel.Dock = DockStyle.Fill;
             leftPanel.Location = new Point(3, 3);
@@ -196,6 +236,7 @@ namespace ChatClient
             leftPanel.Padding = new Padding(12, 10, 8, 12);
             leftPanel.Size = new Size(324, 632);
             leftPanel.TabIndex = 0;
+
             // 
             // lblConvosTitle
             // 
@@ -206,10 +247,73 @@ namespace ChatClient
             lblConvosTitle.Size = new Size(151, 30);
             lblConvosTitle.TabIndex = 0;
             lblConvosTitle.Text = "Conversations";
+
+            // 
+            // btnCreateGroup
+            // 
+            btnCreateGroup.AutoSize = true;
+            btnCreateGroup.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            btnCreateGroup.Location = new Point(220, 0);
+            btnCreateGroup.Name = "btnCreateGroup";
+            btnCreateGroup.Padding = new Padding(10, 4, 10, 4);
+            btnCreateGroup.Size = new Size(88, 38);
+            btnCreateGroup.TabIndex = 2;
+            btnCreateGroup.Text = "+ Group";
+            btnCreateGroup.UseVisualStyleBackColor = true;
+
+            // 
+            // convoMenu
+            // 
+            convoMenu.ImageScalingSize = new Size(24, 24);
+            convoMenu.Items.AddRange(new ToolStripItem[] {
+                miPin,
+                miUnpin,
+                miSep1,
+                miLeaveGroup,
+                miSep2,
+                miDeleteConvo
+            });
+            convoMenu.Name = "convoMenu";
+            convoMenu.Size = new Size(241, 170);
+            convoMenu.Opening += ConvoMenu_Opening;
+
+            // 
+            // miPin
+            // 
+            miPin.Name = "miPin";
+            miPin.Size = new Size(240, 32);
+            miPin.Text = "📌 Ghim";
+            miPin.Click += MiPin_Click;
+
+            // 
+            // miUnpin
+            // 
+            miUnpin.Name = "miUnpin";
+            miUnpin.Size = new Size(240, 32);
+            miUnpin.Text = "📌 Bỏ ghim";
+            miUnpin.Click += MiUnpin_Click;
+
+            // 
+            // miLeaveGroup
+            // 
+            miLeaveGroup.Name = "miLeaveGroup";
+            miLeaveGroup.Size = new Size(240, 32);
+            miLeaveGroup.Text = "🚪 Rời nhóm";
+            miLeaveGroup.Click += MiLeaveGroup_Click;
+
+            // 
+            // miDeleteConvo
+            // 
+            miDeleteConvo.Name = "miDeleteConvo";
+            miDeleteConvo.Size = new Size(240, 32);
+            miDeleteConvo.Text = "🗑️ Xóa cuộc trò chuyện";
+            miDeleteConvo.Click += MiDeleteConvo_Click;
+
             // 
             // lvConvos
             // 
             lvConvos.Columns.AddRange(new ColumnHeader[] { colName, colLast, colUnread });
+            lvConvos.ContextMenuStrip = convoMenu; // ✅ attach menu
             lvConvos.FullRowSelect = true;
             lvConvos.Location = new Point(-3, 33);
             lvConvos.MultiSelect = false;
@@ -219,21 +323,25 @@ namespace ChatClient
             lvConvos.UseCompatibleStateImageBehavior = false;
             lvConvos.View = View.Details;
             lvConvos.SelectedIndexChanged += lvConvos_SelectedIndexChanged;
+
             // 
             // colName
             // 
             colName.Text = "Name";
             colName.Width = 70;
+
             // 
             // colLast
             // 
             colLast.Text = "Last";
             colLast.Width = 70;
+
             // 
             // colUnread
             // 
             colUnread.Text = "Unread";
             colUnread.Width = 80;
+
             // 
             // rightPanel
             // 
@@ -247,6 +355,7 @@ namespace ChatClient
             rightPanel.Padding = new Padding(10, 10, 12, 12);
             rightPanel.Size = new Size(758, 632);
             rightPanel.TabIndex = 1;
+
             // 
             // chatHeader
             // 
@@ -257,6 +366,7 @@ namespace ChatClient
             chatHeader.Name = "chatHeader";
             chatHeader.Size = new Size(736, 80);
             chatHeader.TabIndex = 0;
+
             // 
             // lblChatTitle
             // 
@@ -267,6 +377,7 @@ namespace ChatClient
             lblChatTitle.Size = new Size(61, 30);
             lblChatTitle.TabIndex = 0;
             lblChatTitle.Text = "Chat";
+
             // 
             // lblChatSub
             // 
@@ -276,6 +387,7 @@ namespace ChatClient
             lblChatSub.Name = "lblChatSub";
             lblChatSub.Size = new Size(0, 30);
             lblChatSub.TabIndex = 1;
+
             // 
             // inputPanel
             // 
@@ -288,6 +400,7 @@ namespace ChatClient
             inputPanel.Padding = new Padding(0, 10, 0, 0);
             inputPanel.Size = new Size(736, 60);
             inputPanel.TabIndex = 1;
+
             // 
             // btnSend
             // 
@@ -298,6 +411,7 @@ namespace ChatClient
             btnSend.Size = new Size(110, 50);
             btnSend.TabIndex = 0;
             btnSend.Text = "Send";
+
             // 
             // txtMessage
             // 
@@ -308,6 +422,7 @@ namespace ChatClient
             txtMessage.Name = "txtMessage";
             txtMessage.Size = new Size(736, 50);
             txtMessage.TabIndex = 1;
+
             // 
             // chatScrollHost
             // 
@@ -319,6 +434,7 @@ namespace ChatClient
             chatScrollHost.Padding = new Padding(10);
             chatScrollHost.Size = new Size(736, 610);
             chatScrollHost.TabIndex = 2;
+
             // 
             // chatFlow
             // 
@@ -330,6 +446,7 @@ namespace ChatClient
             chatFlow.Size = new Size(736, 493);
             chatFlow.TabIndex = 0;
             chatFlow.WrapContents = false;
+
             // 
             // ChatAppForm
             // 
@@ -342,6 +459,7 @@ namespace ChatClient
             StartPosition = FormStartPosition.CenterScreen;
             Text = "Secure Chat Client";
             Load += ChatAppForm_Load;
+
             root.ResumeLayout(false);
             header.ResumeLayout(false);
             header.PerformLayout();
@@ -358,7 +476,5 @@ namespace ChatClient
         }
 
         #endregion
-
-        private ColumnHeader colUnread;
     }
 }
