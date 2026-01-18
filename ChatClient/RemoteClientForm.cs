@@ -20,14 +20,14 @@ namespace ChatClient
         volatile bool _closing = false;
         volatile bool _connected = false;
 
-        // user pressed Disconnect => do not auto reconnect
+        
         volatile bool _manualDisconnect = false;
 
-        // reconnect loop control
+        
         CancellationTokenSource? _reconnectCts;
         int _reconnectRunning = 0;
 
-        // remember last endpoint for reconnect
+       
         string _serverIp = "";
         int _serverPort = 5000;
 
@@ -40,38 +40,38 @@ namespace ChatClient
         readonly Dictionary<string, TaskCompletionSource<string>> _pubWaiters = new();
         readonly object _pubLock = new();
 
-        // ===== User directory (from server UserList snapshot)
-        readonly Dictionary<string, string> _userNames = new(); // clientId -> username
-        readonly Dictionary<string, bool> _userOnline = new();  // clientId -> online
+        
+        readonly Dictionary<string, string> _userNames = new(); 
+        readonly Dictionary<string, bool> _userOnline = new();  
         string? _activePeerId = null;
         string? _activePeerUser = null;
 
-        // ===== Conversation UX (no new controls, reuse lstUsers)
-        readonly Dictionary<string, int> _unread = new();                 // peerId -> count
-        readonly Dictionary<string, (long ts, string preview)> _lastMsg = new(); // peerId -> last message
+         
+        readonly Dictionary<string, int> _unread = new();                
+        readonly Dictionary<string, (long ts, string preview)> _lastMsg = new(); 
         readonly object _convLock = new();
 
-        // ===== message preview/status (outgoing)
-        readonly Dictionary<string, string> _sentMessagePreview = new(); // msgId -> "Me → X: ..."
-        readonly Dictionary<string, string> _msgStatus = new();          // msgId -> accepted/delivered/offline_saved/delivered_to_client/timeout
+     
+        readonly Dictionary<string, string> _sentMessagePreview = new(); 
+        readonly Dictionary<string, string> _msgStatus = new();          
         readonly object _statusLock = new();
 
-        // ===== NEW: Track status token positions (avoid ACK spam lines)
+        
         readonly Dictionary<string, int> _statusTokenPos = new();
         readonly object _statusTokenLock = new();
 
-        // idempotent incoming
+        
         readonly HashSet<string> _seenIncoming = new();
         readonly object _seenLock = new();
 
-        // resend
+       
         class PendingMsg
         {
             public ChatPacket Packet = new ChatPacket();
             public int Attempts = 0;
             public long FirstSentMs;
             public long LastSentMs;
-            public string Stage = "new"; // new/accepted/offline_saved/delivered/delivered_to_client/timeout
+            public string Stage = "new"; 
         }
 
         readonly Dictionary<string, PendingMsg> _pending = new();
@@ -79,12 +79,12 @@ namespace ChatClient
 
         System.Windows.Forms.Timer _resendTimer;
 
-        // ===== Typing (debounced, no spam)
-        System.Windows.Forms.Timer _typingUiClearTimer;   // clears typing line in UI after idle
-        System.Windows.Forms.Timer _typingSendDebounce;   // debounces outgoing typing packets
+        
+        System.Windows.Forms.Timer _typingUiClearTimer;   
+        System.Windows.Forms.Timer _typingSendDebounce;   
         bool _typingSent = false;
         long _lastTypedAtMs = 0;
-        string? _typingUser; // currently displayed typing user in rtbChat
+        string? _typingUser; 
 
         public RemoteClientForm()
         {
@@ -107,7 +107,7 @@ namespace ChatClient
                 File.WriteAllText(privPath, _privXml);
             }
 
-            // Typing UI clear (when remote typing stops)
+          
             _typingUiClearTimer = new System.Windows.Forms.Timer();
             _typingUiClearTimer.Interval = 1500;
             _typingUiClearTimer.Tick += (s, e) =>
@@ -116,9 +116,9 @@ namespace ChatClient
                 _typingUiClearTimer.Stop();
             };
 
-            // Typing debounce send (outgoing)
+           
             _typingSendDebounce = new System.Windows.Forms.Timer();
-            _typingSendDebounce.Interval = 350; // send at most ~3 packets/sec while typing
+            _typingSendDebounce.Interval = 350; 
             _typingSendDebounce.Tick += (s, e) =>
             {
                 _typingSendDebounce.Stop();
@@ -135,7 +135,7 @@ namespace ChatClient
                 var peerId = GetClientIdByDisplay(display);
                 if (peerId == null) return;
 
-                // chặn chọn chính mình
+              
                 if (peerId == _clientId)
                 {
                     UI(() => lstUsers.ClearSelected());
@@ -155,7 +155,7 @@ namespace ChatClient
             this.FormClosing += RemoteClientForm_FormClosing;
         }
 
-        // ================= CONNECT (TOGGLE) =================
+        
         private void btnConnect_Click(object sender, EventArgs e)
         {
             if (IsReallyConnected())
@@ -185,7 +185,7 @@ namespace ChatClient
 
             _clientId = LoadOrCreateClientId(_username);
 
-            // Load conversation previews/unread from history so lstUsers looks like "conversation list"
+           
             RebuildConversationSummariesFromDisk();
 
             _closing = false;
@@ -227,7 +227,7 @@ namespace ChatClient
             try { _typingUiClearTimer.Stop(); } catch { }
             try { _typingSendDebounce.Stop(); } catch { }
 
-            // reset outgoing typing state
+          
             _typingSent = false;
 
             lock (_pubLock)
@@ -260,7 +260,7 @@ namespace ChatClient
 
         private void InternalDisconnect(string reason) => InternalDisconnect(reason, sendLogout: true);
 
-        // ================= RECONNECT =================
+        
         private void StartReconnectLoop(string reason)
         {
             if (_closing) return;
@@ -355,7 +355,7 @@ namespace ChatClient
                 _connected = true;
                 SetUiConnected(true);
 
-                // Register again after reconnect
+                
                 SendPacket(new RegisterPacket
                 {
                     ClientId = _clientId,
@@ -378,7 +378,7 @@ namespace ChatClient
             }
         }
 
-        // ================= RECEIVE LOOP =================
+        
         void ReceiveLoop()
         {
             try
@@ -450,7 +450,7 @@ namespace ChatClient
             }
         }
 
-        // ================= USER LIST (render as conversation-ish list) =================
+        
         void HandleUserList(UserListPacket pkt)
         {
             if (pkt?.Users == null) return;
@@ -497,7 +497,7 @@ namespace ChatClient
 
                     foreach (var (id, name) in users)
                     {
-                        // show self too
+                        
                         if (id == _clientId)
                         {
                             lstUsers.Items.Add($"{name} (you)");
@@ -518,7 +518,7 @@ namespace ChatClient
                         string badge = unread > 0 ? $" ({unread})" : "";
                         string status = online ? "" : " (offline)";
 
-                        // lightweight preview: " - lastMessage (HH:mm)"
+                        
                         string previewPart = "";
                         if (last.ts > 0 && !string.IsNullOrWhiteSpace(last.preview))
                         {
@@ -542,7 +542,7 @@ namespace ChatClient
             return s.Length <= max ? s : s.Substring(0, max - 1) + "…";
         }
 
-        // ================= PUBLIC KEY =================
+        
         void HandlePubKey(PublicKeyPacket pkt)
         {
             if (string.IsNullOrEmpty(pkt.ClientId) || string.IsNullOrEmpty(pkt.PublicKey))
@@ -596,7 +596,7 @@ namespace ChatClient
             }
         }
 
-        // ================= CHAT RECEIVE =================
+        
         async void HandleChat(ChatPacket pkt)
         {
             if (pkt == null) return;
@@ -638,7 +638,7 @@ namespace ChatClient
 
             SendReceipt(pkt);
 
-            // Save history
+            
             var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             SaveHistory(new ChatLogEntry
             {
@@ -650,7 +650,7 @@ namespace ChatClient
                 MessageId = pkt.MessageId ?? ""
             });
 
-            // Update conversation preview + unread
+           
             lock (_convLock)
             {
                 _lastMsg[pkt.FromId] = (now, plain);
@@ -691,7 +691,7 @@ namespace ChatClient
             catch { }
         }
 
-        // ================= SEND CHAT =================
+        
         private async void btnSend_Click(object sender, EventArgs e)
         {
             if (!IsReallyConnected())
@@ -778,14 +778,13 @@ namespace ChatClient
 
             _sentMessagePreview[msgId] = $"Me → {_activePeerUser}: {plain}";
 
-            // ===== IMPORTANT: append only ONE line with fixed status token, store token position
+          
             UI(() =>
             {
                 var line = $"Me → {_activePeerUser}: {plain} {StatusToken("new")}\n";
                 int start = rtbChat.TextLength;
                 rtbChat.AppendText(line);
 
-                // token is last 5 chars before '\n'
                 int tokenPos = start + line.Length - 1 - 5;
                 lock (_statusTokenLock)
                 {
@@ -801,7 +800,7 @@ namespace ChatClient
             TrySendTypingStop();
         }
 
-        // ================= ACK / STATUS =================
+        
         void HandleChatAck(ChatAckPacket pkt)
         {
             if (pkt == null) return;
@@ -817,17 +816,16 @@ namespace ChatClient
                 }
             }
 
-            // Persist status to history
+
             SetStatus(pkt.MessageId, pkt.Status ?? "", persistToHistory: true);
 
-            // ===== IMPORTANT: do NOT append ACK lines; update token in place
+     
             UpdateStatusTokenInChatBox(pkt.MessageId, pkt.Status ?? "");
         }
 
         void HandleDeliveryReceipt(DeliveryReceiptPacket pkt)
         {
-            // Compatibility: currently you don't really receive this as delivered_to_client from server,
-            // but keep it for future.
+        
             if (pkt == null) return;
             if (string.IsNullOrEmpty(pkt.MessageId)) return;
 
@@ -894,7 +892,6 @@ namespace ChatClient
             }
         }
 
-        // ===== NEW: fixed-length status tokens (5 chars)
         static string StatusToken(string? status)
         {
             return status switch
@@ -931,7 +928,6 @@ namespace ChatClient
             });
         }
 
-        // ================= RESEND =================
         void ResendTick()
         {
             if (_closing) return;
@@ -975,13 +971,11 @@ namespace ChatClient
             }
         }
 
-        // ================= RECALL =================
         void HandleRecall(RecallPacket pkt)
         {
             UI(() => rtbChat.AppendText($"[Message recalled] id={pkt.MessageId}\n"));
         }
 
-        // ================= TYPING (debounced) =================
         void TxtMessage_TextChanged(object? sender, EventArgs e)
         {
             _lastTypedAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -1076,7 +1070,6 @@ namespace ChatClient
             _typingUser = null;
         }
 
-        // ================= SEND PACKET =================
         void SendPacket<T>(T pkt)
         {
             var ns = _ns;
@@ -1084,7 +1077,6 @@ namespace ChatClient
             PacketIO.SendPacket(ns, pkt);
         }
 
-        // ================= DISPLAY ↔ ID HELPERS =================
         static string ExtractNameFromDisplay(string display)
         {
             var s = display;
@@ -1121,7 +1113,6 @@ namespace ChatClient
             return null;
         }
 
-        // ================= HISTORY =================
         private string LoadOrCreateClientId(string username)
         {
             Directory.CreateDirectory("keys");
@@ -1147,7 +1138,7 @@ namespace ChatClient
         class ChatLogEntry
         {
             public long Ts { get; set; }
-            public string Dir { get; set; } = "";   // in/out/status
+            public string Dir { get; set; } = "";   
             public string PeerId { get; set; } = "";
             public string PeerUser { get; set; } = "";
             public string Text { get; set; } = "";
@@ -1182,7 +1173,7 @@ namespace ChatClient
                 UI(() =>
                 {
                     rtbChat.Clear();
-                    // Reset token mapping for current view
+
                     lock (_statusTokenLock)
                     {
                         _statusTokenPos.Clear();
@@ -1315,7 +1306,7 @@ namespace ChatClient
             catch { }
         }
 
-        // ================= UI HELPERS =================
+
         private void UI(Action a)
         {
             if (InvokeRequired) BeginInvoke(a);
@@ -1355,7 +1346,7 @@ namespace ChatClient
             });
         }
 
-        // Designer stubs
+
         private void btnGetPubKey_Click(object sender, EventArgs e) { }
         private void rtbChat_TextChanged(object sender, EventArgs e) { }
         private void txtServerIP_TextChanged(object sender, EventArgs e) { }

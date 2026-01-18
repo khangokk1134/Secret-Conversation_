@@ -14,7 +14,7 @@ namespace ChatClient
 {
     public partial class ChatAppForm : Form
     {
-        // ================= NETWORK =================
+        
         private TcpClient? _tcp;
         private NetworkStream? _ns;
         private Thread? _recvThread;
@@ -24,47 +24,52 @@ namespace ChatClient
 
         private string _clientId = "";
         private string? _username;
-
         private string _pubXml = "", _privXml = "";
 
         private readonly Dictionary<string, string> _pubCache = new();
         private readonly Dictionary<string, TaskCompletionSource<string>> _pubWaiters = new();
         private readonly object _pubLock = new();
 
-        // incoming idempotent (runtime)
+        private readonly object _sendLock = new();
         private readonly HashSet<string> _seenIncoming = new();
         private readonly object _seenLock = new();
 
-        // pending resend + stage (1-1 only)
+        private class OutgoingFileState
+        {
+            public string FilePath = "";
+            public string FileName = "";
+            public long FileSize;
+            public bool IsImage;
+            public string Mime = "";
+            public string ToId = "";
+        }
+        private readonly Dictionary<string, OutgoingFileState> _outgoingFiles = new();
+
+
         private sealed class PendingMsg
         {
             public ChatPacket Packet = new ChatPacket();
             public int Attempts;
             public long FirstSentMs;
             public long LastSentMs;
-            public string Stage = "new"; // new/accepted/offline_saved/delivered/delivered_to_client/timeout
+            public string Stage = "new";
             public string PlainPreview = "";
         }
-
+     
+        private readonly Dictionary<string, string> _savedFilePaths = new();
         private readonly Dictionary<string, PendingMsg> _pending = new();
         private readonly object _pendingLock = new();
 
-        // ✅ for Seen: remember latest incoming msgId per peer (1-1 only)
+        
         private readonly Dictionary<string, string> _lastIncomingMsgId = new();
-
-        // ✅ prevent spamming seen for same peer+msgId
         private readonly Dictionary<string, string> _lastSeenSent = new();
 
         private System.Windows.Forms.Timer _resendTimer = null!;
         private System.Windows.Forms.Timer _typingDebounce = null!;
 
-        // Active convo key:
-        // - user: clientId
-        // - room: "room:<roomId>"
         private string? _activePeerId;
         private string? _activePeerName;
 
-        // ================= GROUP =====
         private sealed class RoomState
         {
             public string RoomId = "";
@@ -76,11 +81,9 @@ namespace ChatClient
         private bool IsRoomKey(string? key) => !string.IsNullOrEmpty(key) && key.StartsWith("room:", StringComparison.Ordinal);
         private string RoomIdFromKey(string key) => key.Substring("room:".Length);
         private string MakeRoomKey(string roomId) => "room:" + roomId;
-
-        // ================= DATA MODEL (CONVOS) =================
         private sealed class ConvoState
         {
-            public string PeerId = ""; // can be clientId or room:<id>
+            public string PeerId = "";
             public string Name = "";
             public string Last = "";
             public int Unread = 0;
@@ -88,21 +91,28 @@ namespace ChatClient
             public long LastTs = 0;
         }
 
-        private readonly Dictionary<string, ConvoState> _convos = new();  // peerId -> state
-        private readonly Dictionary<string, string> _userNames = new();   // clientId -> username
-
-        // column resize guard
+        private readonly Dictionary<string, ConvoState> _convos = new(); 
+        private readonly Dictionary<string, string> _userNames = new();   
         private bool _fixingColumns = false;
-
-        // when we update list programmatically, prevent selection recursion
         private bool _updatingConvoList = false;
 
-        // ================= PIN / DELETE / LEAVE =================
         private readonly HashSet<string> _pinned = new HashSet<string>(StringComparer.Ordinal);
-
-        // ✅ Context menu instance (Designer có thể có sẵn, nhưng tạo ở code để chắc)
         private ContextMenuStrip _convoMenu = null!;
         private ToolStripMenuItem _miDeleteConvo = null!;
+        private const int FILE_CHUNK_SIZE = 32 * 1024;
+
+        private class IncomingFileState
+        {
+            public string FileName = "";
+            public long FileSize;
+            public bool IsImage;
+            public string SavePath = "";
+            public FileStream? Stream;
+            public long Received;
+            public string FromId = "";  
+
+        }
+        private readonly Dictionary<string, IncomingFileState> _incomingFiles = new();
 
         public ChatAppForm()
         {
@@ -135,10 +145,8 @@ namespace ChatClient
                 InternalDisconnect("closing");
             };
 
-            // IMPORTANT: hook resize ONCE
             chatFlow.Resize += (_, __) => ReflowBubbles();
 
-            // keep Online under title
             Shown += (_, __) => FixChatHeaderLayout();
             Resize += (_, __) => FixChatHeaderLayout();
             lblChatTitle.SizeChanged += (_, __) => FixChatHeaderLayout();
@@ -150,8 +158,66 @@ namespace ChatClient
             FixConvoColumns();
             FixChatHeaderLayout();
 
-            // ✅ position "+ Group" button if exists
             try { PositionCreateGroupButton(); } catch { }
+            BubbleRow.BubbleClicked = (id) =>
+            {
+                if (string.IsNullOrEmpty(id)) return;
+                if (_savedFilePaths.TryGetValue(id, out var p) && File.Exists(p))
+                {
+                    try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(p) { UseShellExecute = true }); }
+                    catch { }
+                    return;
+                }
+                if (_incomingFiles.ContainsKey(id))
+                    StartDownloadFile(id);
+            };
+        }
+        private void StartDownloadFile(string fileId)
+        {
+            if (!IsReallyConnected()) return;
+
+            if (!_incomingFiles.TryGetValue(fileId, out var st))
+                return;
+
+            if (st.Stream != null)
+            {
+                SetStatus("This file is downloading already.", muted: true);
+                return;
+            }
+
+            using var sfd = new SaveFileDialog();
+            sfd.Title = "Save file";
+            sfd.FileName = st.FileName;
+
+            if (sfd.ShowDialog(this) != DialogResult.OK)
+                return;
+
+            if (string.IsNullOrEmpty(st.FromId))
+            {
+                SetStatus("Cannot download: missing sender id.", muted: true);
+                return;
+            }
+
+            try
+            {
+                st.SavePath = sfd.FileName;
+                st.Stream = File.Create(st.SavePath);
+                st.Received = 0;
+
+                SendPacket(new FileAcceptPacket
+                {
+                    FileId = fileId,
+                    FromId = _clientId,  
+                    ToId = st.FromId     
+                });
+                SetStatus("Downloading...", muted: false);
+            }
+            catch (Exception ex)
+            {
+                try { st.Stream?.Dispose(); } catch { }
+                st.Stream = null;
+                SetStatus("Download failed: " + ex.Message, muted: true);
+            }
         }
 
         private void ChatAppForm_Load(object sender, EventArgs e)
@@ -159,8 +225,6 @@ namespace ChatClient
             FixChatHeaderLayout();
             try { PositionCreateGroupButton(); } catch { }
         }
-
-        // ================= FIX: CHAT HEADER LAYOUT =================
         private void FixChatHeaderLayout()
         {
             if (IsDisposed) return;
@@ -183,21 +247,19 @@ namespace ChatClient
             });
         }
 
-        // ================= UI HOOKS =================
         private void HookUI()
         {
             btnConnect.Click += (_, __) => ToggleConnect();
             btnSend.Click += async (_, __) => await SendMessageAsync();
 
-            // ✅ Create group button (Designer có)
             if (btnCreateGroup != null)
-            {
                 btnCreateGroup.Click += (_, __) => CreateGroupUi();
-            }
+
             if (leftPanel != null)
-            {
                 leftPanel.Resize += (_, __) => PositionCreateGroupButton();
-            }
+
+            if (btnSendFile != null)
+                btnSendFile.Click += btnSendFile_Click;
 
             txtMessage.KeyDown += async (s, e) =>
             {
@@ -213,13 +275,12 @@ namespace ChatClient
                 if (!IsReallyConnected()) return;
                 if (string.IsNullOrEmpty(_activePeerId)) return;
                 if (_activePeerId == _clientId) return;
-                if (IsRoomKey(_activePeerId)) return; // typing not implemented for rooms
+                if (IsRoomKey(_activePeerId)) return;
 
                 _typingDebounce.Stop();
                 _typingDebounce.Start();
             };
 
-            // Seen will happen in OpenConversation only (when user clicks a convo)
             lvConvos.SelectedIndexChanged += (_, __) =>
             {
                 if (_updatingConvoList) return;
@@ -245,18 +306,11 @@ namespace ChatClient
             };
         }
 
-        // ✅ Context menu for conversation list
         private void InitConvoContextMenu()
         {
-            // IMPORTANT:
-            // - Designer đã có thể tạo miPin/miUnpin/miLeaveGroup (field),
-            //   nên ở đây chỉ dùng lại nếu có; nếu không có thì tạo mới an toàn.
-
             _convoMenu = new ContextMenuStrip();
             _convoMenu.Opening += ConvoMenu_Opening;
 
-            // miPin / miUnpin / miLeaveGroup có thể tồn tại từ Designer
-            // => dùng trực tiếp, KHÔNG khai báo lại (tránh CS0102/CS0229)
             if (miPin == null) miPin = new ToolStripMenuItem("Pin");
             if (miUnpin == null) miUnpin = new ToolStripMenuItem("Unpin");
             if (miLeaveGroup == null) miLeaveGroup = new ToolStripMenuItem("Leave group");
@@ -277,16 +331,13 @@ namespace ChatClient
             lvConvos.ContextMenuStrip = _convoMenu;
         }
 
-        // ✅ keep "+ Group" at top-right under Conversations title line
         private void PositionCreateGroupButton()
         {
             if (btnCreateGroup == null || leftPanel == null) return;
-
             btnCreateGroup.Top = 0;
             btnCreateGroup.Left = Math.Max(0, leftPanel.ClientSize.Width - btnCreateGroup.Width - 6);
         }
 
-        // ✅ Create group UI by selecting members
         private void CreateGroupUi()
         {
             if (!IsReallyConnected())
@@ -372,7 +423,6 @@ namespace ChatClient
             }
         }
 
-        // ================= FIX COLUMNS =================
         private void FixConvoColumns()
         {
             if (_fixingColumns) return;
@@ -398,7 +448,6 @@ namespace ChatClient
             }
         }
 
-        // ================= STATUS/UI =================
         private void SetStatus(string text, bool muted = false)
         {
             if (IsDisposed) return;
@@ -422,14 +471,14 @@ namespace ChatClient
                 txtMessage.Enabled = connected;
 
                 if (btnCreateGroup != null) btnCreateGroup.Enabled = connected;
+                if (btnSendFile != null) btnSendFile.Enabled = connected;
             });
         }
 
-        // ================= KEYS + CLIENTID =================
         private void LoadKeys()
         {
-            var keyRoot = Path.Combine(DataRoot(), "keys");
-            Directory.CreateDirectory(keyRoot);
+            Directory.CreateDirectory("keys");
+
             var pubPath = Path.Combine("keys", "my_pub.xml");
             var privPath = Path.Combine("keys", "my_priv.xml");
 
@@ -460,7 +509,6 @@ namespace ChatClient
             return id;
         }
 
-        // ================= CONNECT / DISCONNECT =================
         private void ToggleConnect()
         {
             if (IsReallyConnected())
@@ -481,7 +529,6 @@ namespace ChatClient
 
             _clientId = LoadOrCreateClientId(_username);
 
-            // show old conversations even before server userlist arrives
             LoadPinned();
             LoadConvosFromHistory();
             RefreshConvoList();
@@ -556,7 +603,6 @@ namespace ChatClient
             _activePeerName = null;
 
             FixChatHeaderLayout();
-
             SetStatus($"Disconnected: {reason}", muted: true);
         }
 
@@ -574,7 +620,6 @@ namespace ChatClient
                 _pubWaiters.Clear();
             }
 
-            // best-effort logout
             try
             {
                 if (_ns != null && !string.IsNullOrEmpty(_clientId))
@@ -591,7 +636,6 @@ namespace ChatClient
             SetUiConnected(false);
         }
 
-        // ================= RECEIVE LOOP =================
         private void ReceiveLoop()
         {
             try
@@ -614,6 +658,15 @@ namespace ChatClient
 
                     switch (basePkt.Type)
                     {
+
+                        case PacketType.RoomFileOffer:
+                            HandleRoomFileOffer(JsonSerializer.Deserialize<RoomFileOfferPacket>(json)!);
+                            break;
+
+                        case PacketType.FileAccept:
+                            HandleFileAccept(JsonSerializer.Deserialize<FileAcceptPacket>(json)!);
+                            break;
+
                         case PacketType.UserList:
                             HandleUserList(JsonSerializer.Deserialize<UserListPacket>(json)!);
                             break;
@@ -634,7 +687,6 @@ namespace ChatClient
                             HandleDeliveryReceipt(JsonSerializer.Deserialize<DeliveryReceiptPacket>(json)!);
                             break;
 
-                        // ===== GROUP =====
                         case PacketType.RoomInfo:
                             HandleRoomInfo(JsonSerializer.Deserialize<RoomInfoPacket>(json)!);
                             break;
@@ -647,9 +699,20 @@ namespace ChatClient
                             HandleRoomAck(JsonSerializer.Deserialize<RoomAckPacket>(json)!);
                             break;
 
-                        // ✅ NEW: remove room from client list (when user leaves)
                         case PacketType.RoomInfoRemoved:
                             HandleRoomInfoRemoved(JsonSerializer.Deserialize<RoomInfoRemovedPacket>(json)!);
+                            break;
+
+                        case PacketType.FileOffer:
+                            HandleFileOffer(JsonSerializer.Deserialize<FileOfferPacket>(json)!);
+                            break;
+
+                        case PacketType.FileChunk:
+                            HandleFileChunk(JsonSerializer.Deserialize<FileChunkPacket>(json)!);
+                            break;
+
+                        case PacketType.FileComplete:
+                            HandleFileComplete(JsonSerializer.Deserialize<FileCompletePacket>(json)!);
                             break;
 
                         case PacketType.Typing:
@@ -670,7 +733,127 @@ namespace ChatClient
             }
         }
 
-        // ================= USERLIST -> CONVO LIST =================
+
+        private void HandleRoomFileOffer(RoomFileOfferPacket pkt)
+        {
+            if (pkt == null || string.IsNullOrEmpty(pkt.FileId)) return;
+            if (string.IsNullOrEmpty(pkt.RoomId) || string.IsNullOrEmpty(pkt.FromId)) return;
+
+            var roomKey = MakeRoomKey(pkt.RoomId);
+
+            _incomingFiles[pkt.FileId] = new IncomingFileState
+            {
+                FromId = pkt.FromId,
+                FileName = pkt.FileName,
+                FileSize = pkt.FileSize,
+                IsImage = pkt.IsImage,
+                SavePath = "",
+                Stream = null,
+                Received = 0
+            };
+
+            var fromName =
+                !string.IsNullOrWhiteSpace(pkt.FromUser)
+                    ? pkt.FromUser
+                    : (_userNames.TryGetValue(pkt.FromId, out var n) ? n : pkt.FromId);
+
+            if (!_convos.TryGetValue(roomKey, out var c))
+            {
+                var rn = _rooms.TryGetValue(pkt.RoomId, out var rs) ? rs.RoomName : pkt.RoomId;
+                c = new ConvoState
+                {
+                    PeerId = roomKey,
+                    Name = "👥 " + rn,
+                    Online = true
+                };
+                _convos[roomKey] = c;
+            }
+
+            string preview = pkt.IsImage
+                ? $"[Image] {pkt.FileName}"
+                : $"[File] {pkt.FileName} ({pkt.FileSize} bytes)";
+
+            c.Last = preview;
+            c.LastTs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            if (_activePeerId != roomKey) c.Unread++;
+
+            RefreshConvoList();
+
+            SaveHistory(new ChatLogEntry
+            {
+                Ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                Dir = "in",
+                PeerId = roomKey,
+                PeerUser = fromName,
+                Text = pkt.IsImage
+                    ? $"[Image] {pkt.FileName}\n👉 Click to download"
+                    : $"[File] {pkt.FileName} ({pkt.FileSize} bytes)\n👉 Click to download",
+                MessageId = pkt.FileId,
+                Status = ""
+            });
+
+            if (_activePeerId == roomKey)
+            {
+                AddBubble(
+                    false,
+                    fromName,
+                    pkt.IsImage
+                        ? $"[Image] {pkt.FileName}\n👉 Click to download"
+                        : $"[File] {pkt.FileName} ({pkt.FileSize} bytes)\n👉 Click to download",
+                    DateTime.Now,
+                    "Not downloaded",
+                    pkt.FileId
+                );
+            }
+        }
+
+        private void AddImageBubble(bool isMine, string who, string imagePath, DateTime ts, string status, string? messageId = null)
+        {
+            UI(() =>
+            {
+                var row = new BubbleRow(isMine, who, "", ts, status, messageId ?? "");
+                row.Width = chatFlow.ClientSize.Width - SystemInformation.VerticalScrollBarWidth - 4;
+                row.Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top;
+
+                var pb = new PictureBox
+                {
+                    SizeMode = PictureBoxSizeMode.Zoom,
+                    Width = 320,
+                    Height = 220,
+                    Cursor = Cursors.Hand,
+                    Margin = new Padding(0, 6, 0, 0)
+                };
+
+                try
+                {
+                    using var bmpTemp = new Bitmap(imagePath);
+                    pb.Image = new Bitmap(bmpTemp); 
+                }
+                catch
+                {
+                    row.Controls.Clear();
+                    chatFlow.Controls.Add(new BubbleRow(isMine, who, $"[Image] (preview failed)\n{Path.GetFileName(imagePath)}", ts, status, messageId ?? ""));
+                    ScrollToBottom();
+                    return;
+                }
+
+                pb.Click += (_, __) =>
+                {
+                    try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(imagePath) { UseShellExecute = true }); }
+                    catch { }
+                };
+
+                if (row.Controls.Count > 0 && row.Controls[0] is Panel bubblePanel)
+                {
+                    bubblePanel.Controls.Add(pb);
+                }
+
+                chatFlow.Controls.Add(row);
+                row.Reposition();
+                ScrollToBottom();
+            });
+        }
+
         private void HandleUserList(UserListPacket pkt)
         {
             if (pkt?.Users == null) return;
@@ -714,6 +897,47 @@ namespace ChatClient
             FixChatHeaderLayout();
         }
 
+        private void HandleFileAccept(FileAcceptPacket pkt)
+        {
+            if (pkt == null || string.IsNullOrEmpty(pkt.FileId)) return;
+            if (!_outgoingFiles.TryGetValue(pkt.FileId, out var st))
+                return;
+
+            Task.Run(() => SendFileChunksTo(st.FilePath, pkt.FileId, pkt.FromId));
+        }
+
+        private void SendFileChunksTo(string filePath, string fileId, string toId)
+        {
+            int index = 0;
+            using var fs = File.OpenRead(filePath);
+
+            var buffer = new byte[FILE_CHUNK_SIZE];
+            int read;
+
+            while ((read = fs.Read(buffer, 0, buffer.Length)) > 0)
+            {
+                var data = new byte[read];
+                Buffer.BlockCopy(buffer, 0, data, 0, read);
+
+                SendPacket(new FileChunkPacket
+                {
+                    FileId = fileId,
+                    FromId = _clientId,
+                    ToId = toId,
+                    Index = index++,
+                    IsLast = (fs.Position == fs.Length),
+                    Data = data
+                });
+            }
+
+            SendPacket(new FileCompletePacket
+            {
+                FileId = fileId,
+                FromId = _clientId,
+                ToId = toId
+            });
+        }
+
         private void RefreshConvoList()
         {
             if (IsDisposed) return;
@@ -735,15 +959,9 @@ namespace ChatClient
                         .ThenByDescending(x => x.LastTs)
                         .ThenBy(x => x.Name, StringComparer.CurrentCultureIgnoreCase))
                     {
-                        string name;
-                        if (IsRoomKey(c.PeerId))
-                        {
-                            name = c.Name;
-                        }
-                        else
-                        {
-                            name = c.Name + (c.Online ? "" : " (offline)");
-                        }
+                        string name = IsRoomKey(c.PeerId)
+                            ? c.Name
+                            : c.Name + (c.Online ? "" : " (offline)");
 
                         var it = new ListViewItem(name);
                         it.SubItems.Add(string.IsNullOrEmpty(c.Last) ? "" : c.Last);
@@ -769,7 +987,6 @@ namespace ChatClient
             });
         }
 
-        // ================= PUBKEY CACHE =================
         private void HandlePubKey(PublicKeyPacket pkt)
         {
             if (string.IsNullOrEmpty(pkt.ClientId) || string.IsNullOrEmpty(pkt.PublicKey))
@@ -823,7 +1040,6 @@ namespace ChatClient
             }
         }
 
-        // ================= CHAT RECEIVE (1-1) =================
         private async void HandleChat(ChatPacket pkt)
         {
             if (pkt == null) return;
@@ -849,7 +1065,6 @@ namespace ChatClient
             }
             catch { return; }
 
-            // prevent duplicates across restarts (offline re-delivery)
             if (HistoryContainsMessageId(pkt.FromId, pkt.MessageId!))
             {
                 SendReceipt(pkt);
@@ -904,7 +1119,6 @@ namespace ChatClient
             }
         }
 
-        // unify receipt meaning to delivered_to_client
         private void SendReceipt(ChatPacket pkt)
         {
             try
@@ -923,7 +1137,6 @@ namespace ChatClient
             catch { }
         }
 
-        // Seen is sent when user opens the conversation (clicks it)
         private void SendSeenIfAny(string peerId)
         {
             try
@@ -951,7 +1164,6 @@ namespace ChatClient
             catch { }
         }
 
-        // ================= GROUP: ROOM INFO =================
         private void HandleRoomInfo(RoomInfoPacket pkt)
         {
             if (pkt == null) return;
@@ -985,7 +1197,6 @@ namespace ChatClient
             RefreshConvoList();
         }
 
-        // ✅ NEW: server says remove this room from my list
         private void HandleRoomInfoRemoved(RoomInfoRemovedPacket pkt)
         {
             if (pkt == null || string.IsNullOrEmpty(pkt.RoomId)) return;
@@ -1013,7 +1224,6 @@ namespace ChatClient
             SetStatus("You left the group.", muted: false);
         }
 
-        // ================= GROUP: ROOM CHAT (E2E) =================
         private async void HandleRoomChat(RoomChatPacket pkt)
         {
             if (pkt == null) return;
@@ -1022,7 +1232,6 @@ namespace ChatClient
                 string.IsNullOrEmpty(pkt.MessageId))
                 return;
 
-            // ===== dedup runtime (same run) =====
             var idem = $"room:{pkt.RoomId}:{pkt.FromId}:{pkt.MessageId}";
             lock (_seenLock)
             {
@@ -1030,22 +1239,14 @@ namespace ChatClient
                 _seenIncoming.Add(idem);
             }
 
-            // ===== Build room key for convo/history =====
             var key = MakeRoomKey(pkt.RoomId);
 
-            // ✅ IMPORTANT:
-            // If message already exists in history (app restart/offline replay),
-            // we MUST still send receipt (so server can remove offline),
-            // but should NOT render/store again.
             bool alreadyInHistory = HistoryContainsMessageId(key, pkt.MessageId!);
 
-            // ===== decrypt AES key for me =====
             if (pkt.EncKeys == null ||
                 !pkt.EncKeys.TryGetValue(_clientId, out var encKeyForMe) ||
                 string.IsNullOrEmpty(encKeyForMe))
             {
-                // If clientId changed (deleted clientid txt), you can't decrypt old offline messages.
-                // Just ignore.
                 return;
             }
 
@@ -1061,12 +1262,10 @@ namespace ChatClient
                 return;
             }
 
-            // Resolve sender name (for UI + history)
             var senderName = !string.IsNullOrWhiteSpace(pkt.FromUser)
                 ? pkt.FromUser
                 : (_userNames.TryGetValue(pkt.FromId, out var nn) && !string.IsNullOrWhiteSpace(nn) ? nn : pkt.FromId);
 
-            // ✅ send room delivery receipt to server (ALWAYS, even if duplicate-history)
             try
             {
                 if (IsReallyConnected())
@@ -1075,8 +1274,8 @@ namespace ChatClient
                     {
                         RoomId = pkt.RoomId,
                         MessageId = pkt.MessageId ?? "",
-                        FromId = _clientId,     // receiver = me
-                        ToId = pkt.FromId,      // original sender
+                        FromId = _clientId,
+                        ToId = pkt.FromId,
                         Status = "delivered_to_client",
                         Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
                     });
@@ -1084,11 +1283,8 @@ namespace ChatClient
             }
             catch { }
 
-            // If already stored in history => don't show/store again
-            if (alreadyInHistory)
-                return;
+            if (alreadyInHistory) return;
 
-            // ===== verify signature =====
             bool verified = false;
             var pub = await EnsurePubKeyAsync(pkt.FromId);
             if (!string.IsNullOrEmpty(pub))
@@ -1097,7 +1293,6 @@ namespace ChatClient
                 catch { verified = false; }
             }
 
-            // ===== ensure convo exists =====
             if (!_convos.TryGetValue(key, out var c))
             {
                 var rn = _rooms.TryGetValue(pkt.RoomId, out var rs) ? rs.RoomName : pkt.RoomId;
@@ -1118,41 +1313,29 @@ namespace ChatClient
 
             RefreshConvoList();
 
-            // ✅ FIX: History must store senderName (NOT group name)
             SaveHistory(new ChatLogEntry
             {
                 Ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                 Dir = "in",
-                PeerId = key,              // room key
-                PeerUser = senderName,     // ✅ sender name
+                PeerId = key,
+                PeerUser = senderName,
                 Text = plain,
                 MessageId = pkt.MessageId ?? "",
                 Status = verified ? "" : "UNVERIFIED"
             });
 
-            // ===== render if active room =====
             if (_activePeerId == key)
             {
-                AddBubble(
-                    isMine: false,
-                    who: senderName,
-                    text: plain,
-                    ts: DateTime.Now,
-                    status: verified ? "" : "UNVERIFIED"
-                );
+                AddBubble(false, senderName, plain, DateTime.Now, verified ? "" : "UNVERIFIED");
             }
         }
-
 
         private void HandleRoomAck(RoomAckPacket pkt)
         {
             if (pkt == null) return;
             if (string.IsNullOrEmpty(pkt.MessageId)) return;
-
             UI(() => UpdateLastMineBubbleStatus(pkt.MessageId, pkt.Status ?? ""));
         }
-
-        // ================= ACK / RECEIPT =================
         private void HandleChatAck(ChatAckPacket pkt)
         {
             if (pkt == null) return;
@@ -1170,7 +1353,7 @@ namespace ChatClient
 
             if (pkt.Status == "seen")
             {
-                var peer = pkt.ToId; // viewer id
+                var peer = pkt.ToId;
                 if (!string.IsNullOrEmpty(peer))
                 {
                     SaveHistory(new ChatLogEntry
@@ -1200,7 +1383,6 @@ namespace ChatClient
             }
         }
 
-        // ================= SEND MESSAGE =================
         private async Task SendMessageAsync()
         {
             if (!IsReallyConnected())
@@ -1218,7 +1400,6 @@ namespace ChatClient
             var plain = txtMessage.Text.Trim();
             if (plain.Length == 0) return;
 
-            // Quick create group: /group RoomName
             if (plain.StartsWith("/group ", StringComparison.OrdinalIgnoreCase))
             {
                 var roomName = plain.Substring(7).Trim();
@@ -1248,7 +1429,6 @@ namespace ChatClient
             var toId = _activePeerId!;
             var toName = _activePeerName ?? toId;
 
-            // ===== ROOM CHAT =====
             if (IsRoomKey(toId))
             {
                 var roomId = RoomIdFromKey(toId);
@@ -1322,14 +1502,13 @@ namespace ChatClient
                     Status = "sent"
                 });
 
-                AddBubble(isMine: true, who: "Me", text: plain, ts: DateTime.Now, status: "…", messageId: msgId);
+                AddBubble(true, "Me", plain, DateTime.Now, "…", msgId);
 
                 txtMessage.Clear();
                 txtMessage.Focus();
                 return;
             }
 
-            // ===== 1-1 CHAT =====
             var pub1 = await EnsurePubKeyAsync(toId);
             if (pub1 == null)
             {
@@ -1391,13 +1570,12 @@ namespace ChatClient
                 Status = "sent"
             });
 
-            AddBubble(isMine: true, who: "Me", text: plain, ts: DateTime.Now, status: "…", messageId: msgId1);
+            AddBubble(true, "Me", plain, DateTime.Now, "…", msgId1);
 
             txtMessage.Clear();
             txtMessage.Focus();
         }
 
-        // ================= RESEND =================
         private void ResendTick()
         {
             if (_closing) return;
@@ -1436,14 +1614,13 @@ namespace ChatClient
             }
         }
 
-        // ================= TYPING (OPTIONAL) =================
         private void SendTyping(bool isTyping)
         {
             try
             {
                 if (!IsReallyConnected()) return;
                 if (string.IsNullOrEmpty(_activePeerId)) return;
-                if (IsRoomKey(_activePeerId)) return;
+                if (IsRoomKey(_activePeerId)) return; 
 
                 SendPacket(new TypingPacket
                 {
@@ -1456,15 +1633,210 @@ namespace ChatClient
             catch { }
         }
 
-        // ================= SEND PACKET =================
         private void SendPacket<T>(T pkt)
         {
             var ns = _ns;
             if (ns == null) return;
-            PacketIO.SendPacket(ns, pkt);
+
+            lock (_sendLock)
+            {
+                PacketIO.SendPacket(ns, pkt);
+            }
         }
 
-        // ================= OPEN CONVO + HISTORY =================
+        private bool IsImageFile(string ext)
+        {
+            ext = ext.ToLowerInvariant();
+            return ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".gif" || ext == ".bmp" || ext == ".webp";
+        }
+
+        private void SendFileToActivePeer(string filePath)
+        {
+            if (!IsReallyConnected()) return;
+            if (string.IsNullOrEmpty(_activePeerId)) return;
+            if (IsRoomKey(_activePeerId)) return;
+
+            var toId = _activePeerId!;
+            var fi = new FileInfo(filePath);
+            var fileId = Guid.NewGuid().ToString("N");
+
+            bool isImage = IsImageFile(fi.Extension);
+            string mime = isImage ? "image/" + fi.Extension.TrimStart('.').ToLowerInvariant()
+                                  : "application/octet-stream";
+
+            _outgoingFiles[fileId] = new OutgoingFileState
+            {
+                FilePath = filePath,
+                FileName = fi.Name,
+                FileSize = fi.Length,
+                IsImage = isImage,
+                Mime = mime,
+                ToId = toId
+            };
+
+            SendPacket(new FileOfferPacket
+            {
+                FileId = fileId,
+                FromId = _clientId,
+                ToId = toId,
+                FileName = fi.Name,
+                FileSize = fi.Length,
+                MimeType = mime,
+                IsImage = isImage
+            });
+
+            AddBubble(true, "Me", $"[File] {fi.Name} ({fi.Length} bytes)\n(Waiting receiver to download…)",
+                DateTime.Now, "Offered", messageId: fileId);
+        }
+
+        private void HandleFileOffer(FileOfferPacket pkt)
+        {
+            if (pkt == null || string.IsNullOrEmpty(pkt.FileId)) return;
+
+            _incomingFiles[pkt.FileId] = new IncomingFileState
+            {
+                FromId = pkt.FromId,
+                FileName = pkt.FileName,
+                FileSize = pkt.FileSize,
+                IsImage = pkt.IsImage,
+                SavePath = "",
+                Stream = null,
+                Received = 0
+            };
+
+            var fromName = _userNames.TryGetValue(pkt.FromId, out var nn) && !string.IsNullOrWhiteSpace(nn)
+                ? nn : pkt.FromId;
+
+            AddBubble(false, fromName,
+                pkt.IsImage
+                    ? $"[Image] {pkt.FileName}\n👉 Click to download"
+                    : $"[File] {pkt.FileName} ({pkt.FileSize} bytes)\n👉 Click to download",
+                DateTime.Now, "Not downloaded", pkt.FileId);
+
+        }
+
+
+        private void HandleFileChunk(FileChunkPacket pkt)
+        {
+            if (pkt == null) return;
+            if (string.IsNullOrEmpty(pkt.FileId)) return;
+
+            if (_incomingFiles.TryGetValue(pkt.FileId, out var st) && st.Stream != null)
+            {
+                st.Stream.Write(pkt.Data, 0, pkt.Data.Length);
+                st.Received += pkt.Data.Length;
+            }
+        }
+
+        private void HandleFileComplete(FileCompletePacket pkt)
+        {
+            if (pkt == null || string.IsNullOrEmpty(pkt.FileId)) return;
+
+            if (_incomingFiles.TryGetValue(pkt.FileId, out var st))
+            {
+                try { st.Stream?.Flush(); } catch { }
+                try { st.Stream?.Dispose(); } catch { }
+                st.Stream = null;
+
+                if (!string.IsNullOrEmpty(st.SavePath))
+                    _savedFilePaths[pkt.FileId] = st.SavePath;
+
+                var fromName = _userNames.TryGetValue(st.FromId, out var nn) && !string.IsNullOrWhiteSpace(nn)
+                    ? nn
+                    : st.FromId;
+
+                if (st.IsImage && !string.IsNullOrEmpty(st.SavePath) && File.Exists(st.SavePath))
+                {
+                    AddImageBubble(false, fromName, st.SavePath, DateTime.Now, "Done", pkt.FileId);
+                }
+                else
+                {
+                    AddBubble(false, fromName,
+                        $"[Saved] {st.FileName}\n👉 Click to open",
+                        DateTime.Now, "Done", pkt.FileId);
+                }
+
+                _incomingFiles.Remove(pkt.FileId);
+            }
+        }
+
+
+
+        private void btnSendFile_Click(object? sender, EventArgs e)
+        {
+            if (!IsReallyConnected())
+            {
+                SetStatus("Not connected", muted: true);
+                return;
+            }
+
+            if (string.IsNullOrEmpty(_activePeerId) || _activePeerId == _clientId)
+            {
+                SetStatus("Select a conversation first.", muted: true);
+                return;
+            }
+
+            using var ofd = new OpenFileDialog();
+            ofd.Title = "Select a file";
+            if (ofd.ShowDialog() != DialogResult.OK) return;
+
+            var path = ofd.FileName;
+
+            if (IsRoomKey(_activePeerId))
+            {
+                Task.Run(() => SendFileToActiveRoom(path));
+                return;
+            }
+
+            Task.Run(() => SendFileToActivePeer(path));
+        }
+
+
+        private void SendFileToActiveRoom(string filePath)
+        {
+            if (!IsReallyConnected()) return;
+            if (string.IsNullOrEmpty(_activePeerId) || !IsRoomKey(_activePeerId)) return;
+
+            var roomKey = _activePeerId;          
+            var roomId = RoomIdFromKey(roomKey);
+            var fi = new FileInfo(filePath);
+            var fileId = Guid.NewGuid().ToString("N");
+
+            bool isImage = IsImageFile(fi.Extension);
+            string mime = isImage
+                ? "image/" + fi.Extension.TrimStart('.').ToLowerInvariant()
+                : "application/octet-stream";
+
+            _outgoingFiles[fileId] = new OutgoingFileState
+            {
+                FilePath = filePath,
+                FileName = fi.Name,
+                FileSize = fi.Length,
+                IsImage = isImage,
+                Mime = mime,
+                ToId = roomKey
+            };
+
+            SendPacket(new RoomFileOfferPacket
+            {
+                RoomId = roomId,
+                FileId = fileId,
+                FromId = _clientId,
+                FromUser = _username ?? "",
+                FileName = fi.Name,
+                FileSize = fi.Length,
+                MimeType = mime,
+                IsImage = isImage
+            });
+
+            AddBubble(true, "Me",
+                isImage
+                    ? $"[Image] {fi.Name} ({fi.Length} bytes)\n(Waiting members to download…)"
+                    : $"[File] {fi.Name} ({fi.Length} bytes)\n(Waiting members to download…)",
+                DateTime.Now, "Offered", fileId);
+        }
+
+
         private void OpenConversation(string peerId, string peerName)
         {
             _activePeerId = peerId;
@@ -1501,12 +1873,10 @@ namespace ChatClient
             if (!IsRoomKey(peerId))
                 SendSeenIfAny(peerId);
         }
-
-        // ================= HISTORY =================
         private sealed class ChatLogEntry
         {
             public long Ts { get; set; }
-            public string Dir { get; set; } = ""; // in/out/sys
+            public string Dir { get; set; } = ""; 
             public string PeerId { get; set; } = "";
             public string PeerUser { get; set; } = "";
             public string Text { get; set; } = "";
@@ -1681,10 +2051,10 @@ namespace ChatClient
 
             return false;
         }
-
-        // ================= CHAT BUBBLES =================
         private sealed class BubbleRow : Panel
         {
+            public static Action<string>? BubbleClicked;
+
             private readonly Panel _bubble;
             private readonly Label _lblWho;
             private readonly Label _lblText;
@@ -1743,6 +2113,20 @@ namespace ChatClient
                     Text = $"{ts:HH:mm}   {status}".Trim(),
                     Margin = new Padding(0, 4, 0, 0),
                 };
+
+                void FireClick()
+                {
+                    if (string.IsNullOrEmpty(MessageId)) return;
+                    BubbleClicked?.Invoke(MessageId);
+                }
+
+                _bubble.Cursor = Cursors.Hand;
+                _lblText.Cursor = Cursors.Hand;
+                _lblMeta.Cursor = Cursors.Hand;
+
+                _bubble.Click += (_, __) => FireClick();
+                _lblText.Click += (_, __) => FireClick();
+                _lblMeta.Click += (_, __) => FireClick();
 
                 var stack = new FlowLayoutPanel
                 {
@@ -1808,6 +2192,8 @@ namespace ChatClient
             }
         }
 
+
+
         private void AddBubble(bool isMine, string who, string text, DateTime ts, string status, string? messageId = null)
         {
             UI(() =>
@@ -1871,6 +2257,13 @@ namespace ChatClient
             }
         }
 
+        private void ScrollToBottom()
+        {
+            if (chatFlow.Controls.Count == 0) return;
+            var last = chatFlow.Controls[chatFlow.Controls.Count - 1];
+            chatFlow.ScrollControlIntoView(last);
+        }
+
         private void UpdateLastMineBubbleStatus(string messageId, string stage)
         {
             string s = stage switch
@@ -1900,14 +2293,6 @@ namespace ChatClient
             }
         }
 
-        private void ScrollToBottom()
-        {
-            if (chatFlow.Controls.Count == 0) return;
-            var last = chatFlow.Controls[chatFlow.Controls.Count - 1];
-            chatFlow.ScrollControlIntoView(last);
-        }
-
-        // ================= UTIL =================
         private string TrimPreview(string text)
         {
             if (string.IsNullOrEmpty(text)) return "";
@@ -1948,11 +2333,8 @@ namespace ChatClient
 
             return true;
         }
-
-        // Designer still hooks this; keep it empty
         private void lvConvos_SelectedIndexChanged(object sender, EventArgs e) { }
 
-        // ================= PIN / DELETE / LEAVE =================
         private string PinnedFilePath()
         {
             var root = Path.Combine(DataRoot(), "history", _clientId);
@@ -2066,7 +2448,6 @@ namespace ChatClient
             SetStatus("Deleted conversation (local).", muted: false);
         }
 
-        // ✅ Leave group: send LeaveRoomPacket to server
         private void MiLeaveGroup_Click(object? sender, EventArgs e)
         {
             var c = GetSelectedConvo();
@@ -2088,9 +2469,9 @@ namespace ChatClient
             }
             catch { }
 
-            // UI will be removed when RoomInfoRemoved arrives from server
             SetStatus("Leaving group...", muted: false);
         }
+
         private static string DataRoot()
         {
             var root = Path.Combine(
@@ -2098,6 +2479,11 @@ namespace ChatClient
                 "SecureChat");
             Directory.CreateDirectory(root);
             return root;
+        }
+
+        private void btnSend_Click(object sender, EventArgs e)
+        {
+
         }
     }
 }

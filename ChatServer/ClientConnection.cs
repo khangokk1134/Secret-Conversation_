@@ -11,11 +11,10 @@ namespace ChatServer
         private readonly Server _server;
         private readonly NetworkStream _ns;
 
-        // serialize writes to NetworkStream (avoid packet interleaving)
         private readonly object _writeLock = new();
         private volatile bool _closed = false;
 
-        // ✅ ensure Unregister is called once
+    
         private volatile bool _unregistered = false;
 
         public string? ClientId { get; private set; }
@@ -35,7 +34,7 @@ namespace ChatServer
             {
                 while (!_closed)
                 {
-                    var json = PacketIO.ReadJson(_ns);   // length-prefixed
+                    var json = PacketIO.ReadJson(_ns);  
                     if (json == null) break;
 
                     _server.Route(json, this);
@@ -49,11 +48,11 @@ namespace ChatServer
             }
             finally
             {
-                Close(); // ✅ Close() will Unregister safely
+                Close(); 
             }
         }
 
-        // Server sets identity after Register
+       
         public void SetIdentity(string clientId, string username, string pubKey)
         {
             ClientId = clientId;
@@ -100,7 +99,7 @@ namespace ChatServer
             if (_closed) return;
             _closed = true;
 
-            // ✅ always unregister once
+        
             try
             {
                 if (!_unregistered && !string.IsNullOrEmpty(ClientId))

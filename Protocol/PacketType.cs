@@ -17,7 +17,7 @@
 
         Logout = 30,
 
-        // ===== GROUP =====
+        
         CreateRoom = 40,
         RoomInfo = 41,
         RoomChat = 42,
@@ -26,5 +26,20 @@
         RoomDeliveryReceipt = 44,
         LeaveRoom = 45,
         RoomInfoRemoved = 46,
+
+       
+        FileAccept = 61,
+        FileChunk = 62,
+        FileComplete = 63,
+
+      
+        RoomFileChunk,
+        RoomFileComplete,
+
+        
+        RoomFileOffer = 70,
+        RoomFileAccept = 71,
+
+
     }
 }

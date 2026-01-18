@@ -4,9 +4,9 @@
     {
         public string MessageId { get; set; } = "";
 
-        // Viewer (người xem) -> Sender (người gửi)
-        public string FromId { get; set; } = ""; // viewer id
-        public string ToId { get; set; } = "";   // sender id
+      
+        public string FromId { get; set; } = ""; 
+        public string ToId { get; set; } = "";   
 
         public long Timestamp { get; set; }
 

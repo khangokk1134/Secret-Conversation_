@@ -22,11 +22,25 @@ namespace ChatServer
 
         private readonly string _offlineFolder = "offline";
 
-        // ✅ offline file locks per receiver to avoid read/write races
+       
         private readonly ConcurrentDictionary<string, object> _offlineLocks = new();
         private object OfflineLock(string clientId) => _offlineLocks.GetOrAdd(clientId, _ => new object());
 
-        // ===== GROUP ROOMS =====
+
+        private void BroadcastToRoom(string roomId, object pkt, string? exceptClientId = null)
+        {
+            if (!_rooms.TryGetValue(roomId, out var room)) return;
+
+            foreach (var mid in room.Members)
+            {
+                if (!string.IsNullOrEmpty(exceptClientId) && mid == exceptClientId)
+                    continue;
+
+                SendPacketToClient(mid, pkt);
+            }
+        }
+
+       
         private sealed class RoomState
         {
             public string RoomId = "";
@@ -85,11 +99,10 @@ namespace ChatServer
 
             BroadcastUserList();
 
-            // ✅ IMPORTANT ORDER:
-            // 1) push room infos first so client rebuilds group list
+           
             BroadcastRoomsTo(clientId);
 
-            // 2) then deliver offline messages (can include RoomChat)
+            
             DeliverOffline(clientId, conn);
         }
 
@@ -120,6 +133,23 @@ namespace ChatServer
             if (string.IsNullOrEmpty(clientId)) return;
             if (_clients.TryGetValue(clientId, out var c))
                 c.SendPacket(pkt);
+        }
+
+        
+        private void RouteRegister(string json, ClientConnection conn)
+        {
+            RegisterPacket? pkt;
+            try { pkt = JsonSerializer.Deserialize<RegisterPacket>(json); }
+            catch { return; }
+            if (pkt == null) return;
+
+            if (string.IsNullOrEmpty(pkt.ClientId) ||
+                string.IsNullOrEmpty(pkt.User) ||
+                string.IsNullOrEmpty(pkt.PublicKey))
+                return;
+
+            conn.SetIdentity(pkt.ClientId, pkt.User, pkt.PublicKey);
+            Register(pkt.ClientId, pkt.User, pkt.PublicKey, conn);
         }
 
         public void Route(string json, ClientConnection senderConn)
@@ -163,7 +193,19 @@ namespace ChatServer
                     RouteSeenReceipt(json);
                     break;
 
-                // ===== GROUP =====
+                case PacketType.FileOffer:
+                    RouteFileOffer(json);
+                    break;
+
+                case PacketType.FileChunk:
+                    RouteFileChunk(json);
+                    break;
+
+                case PacketType.FileComplete:
+                    RouteFileComplete(json);
+                    break;
+
+                
                 case PacketType.CreateRoom:
                     RouteCreateRoom(json);
                     break;
@@ -179,10 +221,56 @@ namespace ChatServer
                 case PacketType.LeaveRoom:
                     RouteLeaveRoom(json);
                     break;
+
+                case PacketType.RoomFileOffer:
+                    RouteRoomFileOffer(json);
+                    break;
+
+                case PacketType.RoomFileAccept: RouteRoomFileAccept(json); break;
             }
         }
 
-        // ===== GROUP: CreateRoom =====
+
+        private void RouteRoomFileOffer(string json)
+        {
+            RoomFileOfferPacket? pkt;
+            try { pkt = JsonSerializer.Deserialize<RoomFileOfferPacket>(json); } catch { return; }
+            if (pkt == null) return;
+
+            if (string.IsNullOrEmpty(pkt.RoomId) || string.IsNullOrEmpty(pkt.FileId) || string.IsNullOrEmpty(pkt.FromId))
+                return;
+
+            if (!_rooms.TryGetValue(pkt.RoomId, out var room)) return;
+            if (!room.Members.Contains(pkt.FromId)) return;
+
+            foreach (var mid in room.Members)
+            {
+                if (mid == pkt.FromId) continue;
+
+                if (_clients.TryGetValue(mid, out var c))
+                    c.SendRaw(json);
+                else
+                    StoreOffline(mid, json);
+            }
+        }
+
+        private void RouteRoomFileAccept(string json)
+        {
+            RoomFileAcceptPacket? pkt;
+            try { pkt = JsonSerializer.Deserialize<RoomFileAcceptPacket>(json); } catch { return; }
+            if (pkt == null) return;
+
+            if (string.IsNullOrEmpty(pkt.RoomId) ||
+                string.IsNullOrEmpty(pkt.FileId) ||
+                string.IsNullOrEmpty(pkt.FromId) ||
+                string.IsNullOrEmpty(pkt.ToId))
+                return;
+
+            SendPacketToClient(pkt.ToId, pkt);
+        }
+
+
+       
         private void RouteCreateRoom(string json)
         {
             CreateRoomPacket? pkt;
@@ -209,7 +297,7 @@ namespace ChatServer
 
             Console.WriteLine($"Room created: {pkt.RoomName} ({pkt.RoomId}) members={members.Count}");
 
-            // Broadcast room info to members (online only is fine; offline will receive at Register via BroadcastRoomsTo)
+           
             var info = new RoomInfoPacket
             {
                 RoomId = room.RoomId,
@@ -236,7 +324,77 @@ namespace ChatServer
             }
         }
 
-        // ===== GROUP: RoomChat =====
+        private void RouteFileOffer(string json)
+        {
+            FileOfferPacket? pkt;
+            try { pkt = JsonSerializer.Deserialize<FileOfferPacket>(json); }
+            catch { return; }
+            if (pkt == null) return;
+
+            if (string.IsNullOrEmpty(pkt.FileId) ||
+                string.IsNullOrEmpty(pkt.FromId) ||
+                string.IsNullOrEmpty(pkt.ToId) ||
+                string.IsNullOrEmpty(pkt.FileName) ||
+                pkt.FileSize < 0)
+                return;
+
+            if (_clients.TryGetValue(pkt.ToId, out var target))
+            {
+                target.SendRaw(json);
+            }
+            else
+            {
+              
+                StoreOffline(pkt.ToId, json);
+            }
+        }
+
+        private void RouteFileChunk(string json)
+        {
+            FileChunkPacket? pkt;
+            try { pkt = JsonSerializer.Deserialize<FileChunkPacket>(json); }
+            catch { return; }
+            if (pkt == null) return;
+
+            if (string.IsNullOrEmpty(pkt.FileId) ||
+                string.IsNullOrEmpty(pkt.FromId) ||
+                string.IsNullOrEmpty(pkt.ToId) ||
+                pkt.Data == null)
+                return;
+
+            if (_clients.TryGetValue(pkt.ToId, out var target))
+            {
+                target.SendRaw(json);
+            }
+            else
+            {
+                
+            }
+        }
+
+        private void RouteFileComplete(string json)
+        {
+            FileCompletePacket? pkt;
+            try { pkt = JsonSerializer.Deserialize<FileCompletePacket>(json); }
+            catch { return; }
+            if (pkt == null) return;
+
+            if (string.IsNullOrEmpty(pkt.FileId) ||
+                string.IsNullOrEmpty(pkt.FromId) ||
+                string.IsNullOrEmpty(pkt.ToId))
+                return;
+
+            if (_clients.TryGetValue(pkt.ToId, out var target))
+            {
+                target.SendRaw(json);
+            }
+            else
+            {
+                StoreOffline(pkt.ToId, json);
+            }
+        }
+
+       
         private void RouteRoomChat(string json)
         {
             RoomChatPacket? pkt;
@@ -257,12 +415,12 @@ namespace ChatServer
             if (!room.Members.Contains(pkt.FromId))
                 return;
 
-            // idempotent for routing room chat
+           
             var idemKey = $"room:{pkt.RoomId}:{pkt.MessageId}";
             if (!_seenMessages.TryAdd(idemKey, 1))
                 return;
 
-            // accepted
+           
             SendPacketToClient(pkt.FromId, new RoomAckPacket
             {
                 RoomId = pkt.RoomId,
@@ -287,7 +445,7 @@ namespace ChatServer
                     }
                     catch
                     {
-                        // if socket send fails, treat as offline
+                        
                         try { target.Close(); } catch { }
                         _clients.TryRemove(memberId, out _);
                         StoreOffline(memberId, json);
@@ -301,7 +459,7 @@ namespace ChatServer
                 }
             }
 
-            // delivered (forwarded or stored)
+            
             SendPacketToClient(pkt.FromId, new RoomAckPacket
             {
                 RoomId = pkt.RoomId,
@@ -311,7 +469,7 @@ namespace ChatServer
             });
         }
 
-        // ===== GROUP: RoomDeliveryReceipt (receiver -> server) =====
+        
         private void RouteRoomDeliveryReceipt(string json)
         {
             RoomDeliveryReceiptPacket? pkt;
@@ -328,10 +486,10 @@ namespace ChatServer
             if (pkt.Status != "delivered_to_client")
                 return;
 
-            // ✅ remove the RoomChat from receiver's offline file
+          
             RemoveOfflineRoomMessage(pkt.FromId, pkt.RoomId, pkt.MessageId);
 
-            // optional: notify original sender
+            
             SendPacketToClient(pkt.ToId, new RoomAckPacket
             {
                 RoomId = pkt.RoomId,
@@ -340,12 +498,12 @@ namespace ChatServer
                 Status = "delivered_to_client"
             });
 
-            // optional: allow resend key cleanup (if needed)
+            
             var idemKey = $"room:{pkt.RoomId}:{pkt.MessageId}";
             _seenMessages.TryRemove(idemKey, out _);
         }
 
-        // ===== GROUP: LeaveRoom =====
+        
         private void RouteLeaveRoom(string json)
         {
             LeaveRoomPacket? pkt;
@@ -364,20 +522,20 @@ namespace ChatServer
 
             room.Members.Remove(pkt.ClientId);
 
-            // tell leaver to remove group from UI
+            
             SendPacketToClient(pkt.ClientId, new RoomInfoRemovedPacket
             {
                 RoomId = pkt.RoomId
             });
 
-            // if room empty -> delete
+            
             if (room.Members.Count == 0)
             {
                 _rooms.TryRemove(pkt.RoomId, out _);
                 return;
             }
 
-            // update remaining members
+            
             var info = new RoomInfoPacket
             {
                 RoomId = room.RoomId,
@@ -389,7 +547,7 @@ namespace ChatServer
                 SendPacketToClient(mid, info);
         }
 
-        // ===== Seen receipt (viewer -> sender) =====
+       
         private void RouteSeenReceipt(string json)
         {
             SeenReceiptPacket? pkt;
@@ -415,22 +573,6 @@ namespace ChatServer
             });
         }
 
-        private void RouteRegister(string json, ClientConnection conn)
-        {
-            RegisterPacket? pkt;
-            try { pkt = JsonSerializer.Deserialize<RegisterPacket>(json); }
-            catch { return; }
-            if (pkt == null) return;
-
-            if (string.IsNullOrEmpty(pkt.ClientId) ||
-                string.IsNullOrEmpty(pkt.User) ||
-                string.IsNullOrEmpty(pkt.PublicKey))
-                return;
-
-            conn.SetIdentity(pkt.ClientId, pkt.User, pkt.PublicKey);
-            Register(pkt.ClientId, pkt.User, pkt.PublicKey, conn);
-        }
-
         private void RouteChat(string json)
         {
             ChatPacket? pkt;
@@ -447,7 +589,7 @@ namespace ChatServer
             if (!_seenMessages.TryAdd(idemKey, 1))
                 return;
 
-            // accepted
+            
             if (_clients.TryGetValue(pkt.FromId, out var sender0))
             {
                 sender0.SendPacket(new ChatAckPacket
@@ -463,7 +605,7 @@ namespace ChatServer
             {
                 target.SendRaw(json);
 
-                // delivered (sent to socket)
+                
                 if (_clients.TryGetValue(pkt.FromId, out var sender1))
                 {
                     sender1.SendPacket(new ChatAckPacket
@@ -479,7 +621,7 @@ namespace ChatServer
             {
                 StoreOffline(pkt.ToId, json);
 
-                // offline_saved
+                
                 if (_clients.TryGetValue(pkt.FromId, out var sender2))
                 {
                     sender2.SendPacket(new ChatAckPacket
@@ -506,7 +648,7 @@ namespace ChatServer
                 string.IsNullOrEmpty(pkt.Status))
                 return;
 
-            // unify meaning
+           
             if (pkt.Status != "delivered_to_client")
                 return;
 
@@ -523,7 +665,7 @@ namespace ChatServer
                 });
             }
 
-            // allow resend key cleanup
+          
             var idemKey = $"{pkt.ToId}:{pkt.FromId}:{pkt.MessageId}";
             _seenMessages.TryRemove(idemKey, out _);
         }
@@ -603,7 +745,7 @@ namespace ChatServer
             {
                 lock (OfflineLock(clientId))
                 {
-                    // ✅ snapshot to avoid races with RemoveOffline*
+                   
                     lines = File.ReadAllLines(file);
                 }
             }
@@ -616,7 +758,7 @@ namespace ChatServer
             }
         }
 
-        // remove 1-1 chat by messageId
+      
         private void RemoveOfflineMessage(string receiverId, string messageId)
         {
             var file = OfflineFile(receiverId);
@@ -636,12 +778,12 @@ namespace ChatServer
                         var raw = line.Trim();
 
                         bool remove = false;
-                        try
-                        {
-                            var pkt = JsonSerializer.Deserialize<ChatPacket>(raw);
-                            if (pkt?.MessageId == messageId) remove = true;
-                        }
-                        catch { }
+
+                        ChatPacket? pkt = null;
+                        try { pkt = JsonSerializer.Deserialize<ChatPacket>(raw); } catch { }
+
+                        if (pkt != null && pkt.MessageId == messageId)
+                            remove = true;
 
                         if (remove) continue;
 
@@ -667,7 +809,7 @@ namespace ChatServer
             }
         }
 
-        // remove room chat by roomId + messageId
+        
         private void RemoveOfflineRoomMessage(string receiverId, string roomId, string messageId)
         {
             var file = OfflineFile(receiverId);
@@ -688,17 +830,18 @@ namespace ChatServer
                         var raw = line.Trim();
 
                         bool remove = false;
-                        try
+
+                        PacketBase? basePkt = null;
+                        try { basePkt = JsonSerializer.Deserialize<PacketBase>(raw); } catch { }
+
+                        if (basePkt != null && basePkt.Type == PacketType.RoomChat)
                         {
-                            var basePkt = JsonSerializer.Deserialize<PacketBase>(raw);
-                            if (basePkt?.Type == PacketType.RoomChat)
-                            {
-                                var rp = JsonSerializer.Deserialize<RoomChatPacket>(raw);
-                                if (rp != null && rp.RoomId == roomId && rp.MessageId == messageId)
-                                    remove = true;
-                            }
+                            RoomChatPacket? rp = null;
+                            try { rp = JsonSerializer.Deserialize<RoomChatPacket>(raw); } catch { }
+
+                            if (rp != null && rp.RoomId == roomId && rp.MessageId == messageId)
+                                remove = true;
                         }
-                        catch { }
 
                         if (remove) continue;
 

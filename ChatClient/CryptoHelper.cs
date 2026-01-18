@@ -7,7 +7,7 @@ namespace ChatClient
 {
     public static class CryptoHelper
     {
-        // RSA key pair with XML (simple)
+      
         public static void GenerateRsaKeys(out string pubXml, out string privXml, int bits = 2048)
         {
             var rsa = new RSACryptoServiceProvider(bits);
@@ -53,7 +53,7 @@ namespace ChatClient
             return Encoding.UTF8.GetString(dec);
         }
 
-        // AES: generate key bytes (32 bytes for AES-256)
+        
         public static byte[] GenerateAesKey(int size = 32)
         {
             var k = new byte[size];
@@ -64,7 +64,7 @@ namespace ChatClient
             return k;
         }
 
-        // AES encrypt to base64, we prefix IV then cipher bytes
+        
         public static string AesEncryptToBase64(string plain, byte[] key)
         {
             using (var aes = Aes.Create())
@@ -73,7 +73,7 @@ namespace ChatClient
                 aes.GenerateIV();
                 using (var ms = new MemoryStream())
                 {
-                    // write IV first
+                    
                     ms.Write(aes.IV, 0, aes.IV.Length);
                     using (var cs = new CryptoStream(ms, aes.CreateEncryptor(), CryptoStreamMode.Write))
                     using (var sw = new StreamWriter(cs, Encoding.UTF8))
