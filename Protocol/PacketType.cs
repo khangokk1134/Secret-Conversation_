@@ -31,8 +31,9 @@
         FileAccept = 61,
         FileChunk = 62,
         FileComplete = 63,
+        FileOffer,
 
-      
+
         RoomFileChunk,
         RoomFileComplete,
 

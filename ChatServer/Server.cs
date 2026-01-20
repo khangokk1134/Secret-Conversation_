@@ -226,6 +226,10 @@ namespace ChatServer
                     RouteRoomFileOffer(json);
                     break;
 
+                case PacketType.FileAccept:
+                    RouteFileAccept(json);
+                    break;
+
                 case PacketType.RoomFileAccept: RouteRoomFileAccept(json); break;
             }
         }
@@ -365,6 +369,28 @@ namespace ChatServer
             if (_clients.TryGetValue(pkt.ToId, out var target))
             {
                 target.SendRaw(json);
+            }
+            else
+            {
+                
+            }
+        }
+
+        private void RouteFileAccept(string json)
+        {
+            FileAcceptPacket? pkt;
+            try { pkt = JsonSerializer.Deserialize<FileAcceptPacket>(json); }
+            catch { return; }
+            if (pkt == null) return;
+
+            if (string.IsNullOrEmpty(pkt.FileId) ||
+                string.IsNullOrEmpty(pkt.FromId) ||
+                string.IsNullOrEmpty(pkt.ToId))
+                return;
+
+            if (_clients.TryGetValue(pkt.ToId, out var sender))
+            {
+                sender.SendRaw(json);
             }
             else
             {

@@ -3,7 +3,7 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
 using System.Linq;
-using System.Net.Sockets;
+using System.Net.Sockets;   
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -100,6 +100,9 @@ namespace ChatClient
         private ContextMenuStrip _convoMenu = null!;
         private ToolStripMenuItem _miDeleteConvo = null!;
         private const int FILE_CHUNK_SIZE = 32 * 1024;
+        private const int PREVIEW_MAX_W = 520; 
+        private const int PREVIEW_MAX_H = 520; 
+
 
         private class IncomingFileState
         {
@@ -109,7 +112,9 @@ namespace ChatClient
             public string SavePath = "";
             public FileStream? Stream;
             public long Received;
-            public string FromId = "";  
+            public string FromId = "";
+            public bool CompleteSignal;
+            public string PeerKey = "";
 
         }
         private readonly Dictionary<string, IncomingFileState> _incomingFiles = new();
@@ -201,7 +206,7 @@ namespace ChatClient
             try
             {
                 st.SavePath = sfd.FileName;
-                st.Stream = File.Create(st.SavePath);
+                st.Stream = new FileStream(st.SavePath, FileMode.Create, FileAccess.Write, FileShare.Read);
                 st.Received = 0;
 
                 SendPacket(new FileAcceptPacket
@@ -743,6 +748,7 @@ namespace ChatClient
 
             _incomingFiles[pkt.FileId] = new IncomingFileState
             {
+                PeerKey = roomKey,
                 FromId = pkt.FromId,
                 FileName = pkt.FileName,
                 FileSize = pkt.FileSize,
@@ -818,16 +824,29 @@ namespace ChatClient
                 var pb = new PictureBox
                 {
                     SizeMode = PictureBoxSizeMode.Zoom,
-                    Width = 320,
-                    Height = 220,
                     Cursor = Cursors.Hand,
                     Margin = new Padding(0, 6, 0, 0)
                 };
 
+
                 try
                 {
                     using var bmpTemp = new Bitmap(imagePath);
-                    pb.Image = new Bitmap(bmpTemp); 
+                    pb.Image = new Bitmap(bmpTemp);                   
+                    int imgW = pb.Image.Width;
+                    int imgH = pb.Image.Height;                   
+                    int maxW = PREVIEW_MAX_W;                 
+                    int viewW = maxW;
+                    int viewH = (int)Math.Round(viewW * (imgH / (double)imgW));
+                   
+                    if (viewH > PREVIEW_MAX_H)
+                    {
+                        viewH = PREVIEW_MAX_H;
+                        viewW = (int)Math.Round(viewH * (imgW / (double)imgH));
+                    }
+
+                    pb.Width = viewW;
+                    pb.Height = viewH;
                 }
                 catch
                 {
@@ -837,6 +856,7 @@ namespace ChatClient
                     return;
                 }
 
+
                 pb.Click += (_, __) =>
                 {
                     try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(imagePath) { UseShellExecute = true }); }
@@ -845,8 +865,14 @@ namespace ChatClient
 
                 if (row.Controls.Count > 0 && row.Controls[0] is Panel bubblePanel)
                 {
-                    bubblePanel.Controls.Add(pb);
+                    // tìm FlowLayoutPanel stack bên trong bubblePanel
+                    var stack = bubblePanel.Controls.OfType<FlowLayoutPanel>().FirstOrDefault();
+                    if (stack != null)
+                        stack.Controls.Add(pb);
+                    else
+                        bubblePanel.Controls.Add(pb);
                 }
+
 
                 chatFlow.Controls.Add(row);
                 row.Reposition();
@@ -1128,8 +1154,8 @@ namespace ChatClient
                 SendPacket(new DeliveryReceiptPacket
                 {
                     MessageId = pkt.MessageId ?? "",
-                    FromId = _clientId,   // receiver
-                    ToId = pkt.FromId,    // sender
+                    FromId = _clientId,  
+                    ToId = pkt.FromId,    
                     Status = "delivered_to_client",
                     Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
                 });
@@ -1155,8 +1181,8 @@ namespace ChatClient
                     SendPacket(new SeenReceiptPacket
                     {
                         MessageId = mid,
-                        FromId = _clientId, // viewer
-                        ToId = peerId,      // sender
+                        FromId = _clientId, 
+                        ToId = peerId,      
                         Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
                     });
                 }
@@ -1695,6 +1721,7 @@ namespace ChatClient
 
             _incomingFiles[pkt.FileId] = new IncomingFileState
             {
+                PeerKey = pkt.FromId,
                 FromId = pkt.FromId,
                 FileName = pkt.FileName,
                 FileSize = pkt.FileSize,
@@ -1723,43 +1750,85 @@ namespace ChatClient
 
             if (_incomingFiles.TryGetValue(pkt.FileId, out var st) && st.Stream != null)
             {
+                if (pkt.Data == null || pkt.Data.Length == 0) return;
+
                 st.Stream.Write(pkt.Data, 0, pkt.Data.Length);
                 st.Received += pkt.Data.Length;
+
+                if (st.CompleteSignal && st.Received >= st.FileSize)
+                {
+                    FinalizeIncomingFile(pkt.FileId, st);
+                }
             }
         }
+
+
+        private void FinalizeIncomingFile(string fileId, IncomingFileState st)
+        {
+            try { st.Stream?.Flush(); } catch { }
+            try { st.Stream?.Dispose(); } catch { }
+            st.Stream = null;
+
+            if (!string.IsNullOrEmpty(st.SavePath))
+                _savedFilePaths[fileId] = st.SavePath;
+
+            var fromName = _userNames.TryGetValue(st.FromId, out var nn) && !string.IsNullOrWhiteSpace(nn)
+                ? nn : st.FromId;
+
+            
+            if (!string.IsNullOrEmpty(st.SavePath))
+            {
+                SaveHistory(new ChatLogEntry
+                {
+                    Ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                    Dir = "file",
+                    PeerId = st.PeerKey,        
+                    PeerUser = fromName,
+                    Text = st.FileName,
+                    MessageId = fileId,
+                    Status = "saved",
+                    IsFile = true,
+                    IsImage = st.IsImage,
+                    LocalPath = st.SavePath
+                });
+            }
+
+            
+            if (_activePeerId == st.PeerKey)
+            {
+                if (st.IsImage && File.Exists(st.SavePath))
+                    AddImageBubble(false, fromName, st.SavePath, DateTime.Now, "Done", fileId);
+                else
+                    AddBubble(false, fromName, $"[Saved] {st.FileName}\n👉 Click to open", DateTime.Now, "Done", fileId);
+            }
+
+            _incomingFiles.Remove(fileId);
+            SetStatus("Download completed.", muted: false);
+
+            Console.WriteLine($"FILE DONE {fileId}: received={st.Received} expected={st.FileSize}");
+        }
+
 
         private void HandleFileComplete(FileCompletePacket pkt)
         {
             if (pkt == null || string.IsNullOrEmpty(pkt.FileId)) return;
 
-            if (_incomingFiles.TryGetValue(pkt.FileId, out var st))
+            if (!_incomingFiles.TryGetValue(pkt.FileId, out var st))
+                return;
+
+           
+            st.CompleteSignal = true;
+
+            
+            if (st.Stream != null && st.Received >= st.FileSize)
             {
-                try { st.Stream?.Flush(); } catch { }
-                try { st.Stream?.Dispose(); } catch { }
-                st.Stream = null;
-
-                if (!string.IsNullOrEmpty(st.SavePath))
-                    _savedFilePaths[pkt.FileId] = st.SavePath;
-
-                var fromName = _userNames.TryGetValue(st.FromId, out var nn) && !string.IsNullOrWhiteSpace(nn)
-                    ? nn
-                    : st.FromId;
-
-                if (st.IsImage && !string.IsNullOrEmpty(st.SavePath) && File.Exists(st.SavePath))
-                {
-                    AddImageBubble(false, fromName, st.SavePath, DateTime.Now, "Done", pkt.FileId);
-                }
-                else
-                {
-                    AddBubble(false, fromName,
-                        $"[Saved] {st.FileName}\n👉 Click to open",
-                        DateTime.Now, "Done", pkt.FileId);
-                }
-
-                _incomingFiles.Remove(pkt.FileId);
+                FinalizeIncomingFile(pkt.FileId, st);
+            }
+            else
+            {
+                Console.WriteLine($"WAIT MORE CHUNKS {pkt.FileId}: received={st.Received}, expected={st.FileSize}");
             }
         }
-
 
 
         private void btnSendFile_Click(object? sender, EventArgs e)
@@ -1790,7 +1859,6 @@ namespace ChatClient
 
             Task.Run(() => SendFileToActivePeer(path));
         }
-
 
         private void SendFileToActiveRoom(string filePath)
         {
@@ -1876,13 +1944,18 @@ namespace ChatClient
         private sealed class ChatLogEntry
         {
             public long Ts { get; set; }
-            public string Dir { get; set; } = ""; 
+            public string Dir { get; set; } = "";
             public string PeerId { get; set; } = "";
             public string PeerUser { get; set; } = "";
             public string Text { get; set; } = "";
             public string MessageId { get; set; } = "";
             public string Status { get; set; } = "";
+
+            public bool IsFile { get; set; }
+            public bool IsImage { get; set; }
+            public string LocalPath { get; set; } = "";
         }
+
 
         private string GetHistoryFile(string peerId)
         {
@@ -1947,6 +2020,28 @@ namespace ChatClient
                     if (!string.IsNullOrEmpty(e.Status) && !mine)
                         status = e.Status;
 
+                    // ===== FILE / IMAGE =====
+                    if (e.IsFile)
+                    {
+                        if (!string.IsNullOrEmpty(e.LocalPath) && File.Exists(e.LocalPath))
+                            _savedFilePaths[e.MessageId] = e.LocalPath;
+
+                        if (e.IsImage && !string.IsNullOrEmpty(e.LocalPath) && File.Exists(e.LocalPath))
+                        {
+                            AddImageBubble(mine, who, e.LocalPath, dt, "Done", e.MessageId);
+                        }
+                        else
+                        {
+                            string text = (!string.IsNullOrEmpty(e.LocalPath) && File.Exists(e.LocalPath))
+                                ? $"[Saved] {e.Text}\n👉 Click to open"
+                                : $"[File] {e.Text}\n👉 Click to download";
+
+                            AddBubble(mine, who, text, dt, status, e.MessageId);
+                        }
+                        continue;
+                    }
+
+                    // ===== TEXT =====
                     AddBubble(mine, who, e.Text, dt, status, e.MessageId);
                 }
 
@@ -2191,8 +2286,6 @@ namespace ChatClient
                 Reposition();
             }
         }
-
-
 
         private void AddBubble(bool isMine, string who, string text, DateTime ts, string status, string? messageId = null)
         {
@@ -2480,7 +2573,6 @@ namespace ChatClient
             Directory.CreateDirectory(root);
             return root;
         }
-
         private void btnSend_Click(object sender, EventArgs e)
         {
 
